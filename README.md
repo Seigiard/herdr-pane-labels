@@ -14,7 +14,7 @@ changes that do not produce an event.
 ## Install
 
 ```bash
-herdr plugin install Seigiard/herdr-pane-labels --ref v0.2.1 -y
+herdr plugin install Seigiard/herdr-pane-labels --ref v0.2.2 -y
 herdr plugin enable seigi.pane-labels
 ```
 
@@ -33,10 +33,13 @@ must still handle Herdr's `agent_name_taken` response after registration.
 ## Lifecycle
 
 The package owns the ordinary runtime lifecycle through the Herdr actions
-`start`, `stop`, `update`, and `diagnostics`. `sweep` requests one immediate
-reconciliation. The package preserves complete-snapshot validation, generation
-checks, target identity revalidation, explicit metadata clearing, stale Git
-location handling, and one active writer per socket.
+`start`, `stop`, `update`, and `diagnostics`. `update` stops the current daemon,
+installs and enables the replacement, reloads configuration when a server is
+running, performs a strict reconciliation, and restores daemon ownership on a
+failed post-install check. `sweep` requests one immediate reconciliation. The
+package preserves complete-snapshot validation, generation checks, target
+identity revalidation, explicit metadata clearing, stale Git location handling,
+and one active writer per socket.
 
 The package does not own sidebar rows or personal presentation settings. Those
 remain in the user's Herdr `config.toml`.

@@ -121,7 +121,7 @@ case "$mode" in
     exit
     ;;
   diagnostics)
-    printf 'version=0.2.1\n'
+    printf 'version=0.2.2\n'
     printf 'state_dir=%s\n' "$STATE_DIR"
     printf 'socket=%s\n' "${SOCKET_PATH:-unset}"
     printf 'engine=%s\n' "$SELF"
@@ -1880,7 +1880,7 @@ stop_sweep_daemon() {
   [ "$current_start" = "$start" ] || return 1
   command="$(ps -ww -p "$pid" -o command= 2>/dev/null)"
   case "$command" in
-    *"$SELF --sweep-daemon"*) ;;
+    *"/herdr-pane-labels --sweep-daemon"*) ;;
     *) return 1 ;;
   esac
   kill -TERM "$pid" 2>/dev/null || return 1
