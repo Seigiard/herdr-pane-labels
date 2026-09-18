@@ -1,0 +1,1934 @@
+#!/usr/bin/env bash
+# Reconcile registered Herdr agent aliases, pane and tab labels, and Git
+# location metadata from complete live snapshots. Event payloads are only
+# invalidations; this process never derives intent from them.
+
+set -uo pipefail
+
+script_path() {
+  local self="$0"
+  case "$self" in
+    */*) ;;
+    *) self="$(command -v "$self" 2>/dev/null)" ;;
+  esac
+  [ -n "$self" ] || return 1
+  printf '%s' "$self"
+}
+
+SELF="$(script_path)" || exit 0
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd -P)" || exit 0
+# The deployed library path is resolved relative to this script.
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/../lib/herdr-aliases.sh" || exit 0
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/../lib/herdr-process.sh" || exit 0
+
+STATE_DIR="${HERDR_PANE_LABELS_STATE_DIR:-$HOME/.cache/herdr-pane-labels}"
+LOCATION_SOURCE_ID="location-sync"
+PROC_LABEL_MAX_LEN=24
+# An idle pane still holds a slot in the tab, so it is named rather than
+# dropped: the tab label then shows how many panes the tab has.
+IDLE_PANE_LABEL="~"
+# Panes are joined with a middle dot (U+00B7): a full-height bar drew a wall
+# through the tab row.
+LABEL_SEPARATOR="${HERDR_PANE_LABELS_SEPARATOR:- · }"
+# Codicon glyphs of the $git_ref grammar, generated from bash 3.2-safe octal
+# UTF-8 sequences (printf understands \NNN octal but not \uXXXX). Raw PUA
+# glyphs are easily lost when the file passes through editors or agents, so
+# none may appear verbatim in this script.
+ICON_BRANCH="$(printf '\356\261\257')"   # nf-cod-git_branch U+EC6F
+ICON_WORKTREE="$(printf '\356\261\276')" # nf-cod-worktree U+EC7E
+ICON_COMMIT="$(printf '\356\253\274')"   # nf-cod-git_commit U+EAFC
+ICON_FOLDER="$(printf '\356\252\203')"   # nf-cod-folder U+EA83
+# The status vocabulary this repo used before 21aaaf0 removed it, restored
+# unchanged so a reader who learned it once still reads it the same way.
+ICON_PULL="$(printf '\342\207\243')"   # U+21E3 downwards dashed arrow
+ICON_PUSH="$(printf '\342\207\241')"   # U+21E1 upwards dashed arrow
+ICON_CONFLICT='~'
+ICON_STAGED='+'
+ICON_UNSTAGED='!'
+ICON_UNTRACKED='?'
+ICON_STALE="$(printf '\356\252\202')"    # nf-cod-history U+EA82
+# Worktree-token width math (text_length's `wc -m`, text_prefix's `cut -c`)
+# must count codepoints: under a non-UTF-8 locale both count bytes, so a cap
+# can split a multibyte path component.
+# The daemon inherits its locale from whatever hook spawned it, so it pins its
+# own: keep an inherited UTF-8 locale, otherwise take the first UTF-8 locale
+# the system offers; only a system without any falls back to byte counting.
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+  *[Uu][Tt][Ff]8 | *[Uu][Tt][Ff]-8)
+    TEXT_LOCALE="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
+    ;;
+  *)
+    TEXT_LOCALE="$(locale -a 2>/dev/null | grep -i -m1 '\.utf-*8$' || true)"
+    [ -n "$TEXT_LOCALE" ] || TEXT_LOCALE=C
+    ;;
+esac
+FIELD_SEPARATOR=$'\037'
+STATUS_SEPARATOR=$'\036'
+WORKTREE_TOKEN_MAX_LEN=18
+LOCATION_GIT_BUDGET="${HERDR_PANE_LABELS_GIT_BUDGET:-0.075}"
+# The space probe scans the working tree, which the scan-free rev-parse budget
+# above is not calibrated for. Measured at or under 10 ms warm on this repo and
+# its main checkout; the budget is an order of magnitude above that so a cold
+# or large tree degrades to "no counts" instead of to wrong ones.
+SPACE_STATUS_BUDGET="${HERDR_PANE_LABELS_STATUS_BUDGET:-0.5}"
+# Seconds between two sweeps of the daemon. Five keeps a finished command
+# visible for at most one glance without hammering the herdr socket.
+SWEEP_INTERVAL="${HERDR_PANE_LABELS_SWEEP_INTERVAL:-5}"
+SWEEP_LOCK_DIR="$STATE_DIR/sweep.lock"
+INBOX_LOCK_ATTEMPTS="${HERDR_PANE_LABELS_LOCK_ATTEMPTS:-20}"
+SOCKET_PATH="${HERDR_SOCKET_PATH:-}"
+STRICT_SWEEP="${HERDR_PANE_LABELS_STRICT_SWEEP:-0}"
+
+mode=""
+alias_seed=""
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: herdr-pane-labels --event | --sweep | --sweep-daemon | --ensure-sweep-daemon
+       herdr-pane-labels --alias-candidates <seed>
+       herdr-pane-labels --stop | --diagnostics
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --event) mode="event"; shift ;;
+    --presentation-worker) mode="presentation-worker"; shift ;;
+    --sweep) mode="sweep"; shift ;;
+    --sweep-daemon) mode="sweep-daemon"; shift ;;
+    --ensure-sweep-daemon) mode="ensure-sweep-daemon"; shift ;;
+    --alias-candidates)
+      [ $# -ge 2 ] || { usage; exit 2; }
+      mode="alias-candidates"
+      alias_seed="$2"
+      shift 2
+      ;;
+    --stop) mode="stop"; shift ;;
+    --diagnostics) mode="diagnostics"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage; exit 2 ;;
+  esac
+done
+
+[ -n "$mode" ] || { usage; exit 2; }
+
+case "$mode" in
+  alias-candidates)
+    [ $# -eq 0 ] || { usage; exit 2; }
+    herdr_alias_candidates "$alias_seed"
+    exit
+    ;;
+  diagnostics)
+    printf 'version=0.2.0\n'
+    printf 'state_dir=%s\n' "$STATE_DIR"
+    printf 'socket=%s\n' "${SOCKET_PATH:-unset}"
+    printf 'engine=%s\n' "$SELF"
+    exit
+    ;;
+esac
+
+# ---------------------------------------------------------------- utilities
+
+# A microsecond floor for monotonic reconciliation generations and metadata.
+now_seq() {
+  if [ -n "${HERDR_PANE_LABELS_TEST_NOW_SEQ:-}" ]; then
+    printf '%s' "$HERDR_PANE_LABELS_TEST_NOW_SEQ"
+    return 0
+  fi
+  herdr_now_seq
+}
+
+encode_key() {
+  # Parameter expansion rather than a tr pipeline. This runs on every state
+  # path resolution, so the two forks it saves outweigh the work it does.
+  # Deleting newlines before translating is safe: the classes '/+' and '=\n'
+  # are disjoint, so neither step can see the other's characters.
+  local encoded
+  encoded="$(printf '%s' "$1" | base64)"
+  encoded="${encoded//$'\n'/}"
+  encoded="${encoded//\//_}"
+  encoded="${encoded//+/-}"
+  printf '%s' "${encoded//=/}"
+}
+
+encode_value() {
+  local encoded
+  encoded="$(printf '%s' "$1" | base64)"
+  printf '%s' "${encoded//$'\n'/}"
+}
+
+namespace_dir() {
+  [ -n "$SOCKET_PATH" ] || return 1
+  # SOCKET_PATH is fixed for the process's lifetime, so the encoded path is
+  # computed once instead of forking base64/tr on every call.
+  [ -n "${_NAMESPACE_DIR:-}" ] || _NAMESPACE_DIR="$STATE_DIR/sockets/$(encode_key "$SOCKET_PATH")"
+  printf '%s' "$_NAMESPACE_DIR"
+}
+
+atomic_write() {
+  local file="$1" content="$2" dir tmp
+  [ ! -d "$file" ] || return 1
+  dir="${file%/*}"
+  [ "$dir" != "$file" ] || dir="."
+  [ -n "$dir" ] || dir="/"
+  # mkdir -p succeeds on an existing directory, so skipping it when the
+  # directory is already there drops a fork without changing any failure path.
+  [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || return 1
+  tmp="$(umask 077; mktemp "$dir/.record.XXXXXX" 2>/dev/null)" || return 1
+  if ! printf '%s\n' "$content" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if [ -d "$file" ] || ! mv "$tmp" "$file" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  return 0
+}
+
+record_number() {
+  local file="$1" key="$2" line value=""
+  [ -f "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "${key}="*) value="${line#*=}"; break ;;
+    esac
+  done < "$file" 2>/dev/null
+  case "$value" in
+    '' | *[!0-9]*) return 0 ;;
+  esac
+  printf '%s' "$value"
+}
+
+max_number() {
+  local max=0 value
+  for value in "$@"; do
+    case "$value" in '' | *[!0-9]*) continue ;; esac
+    [ "$value" -le "$max" ] || max="$value"
+  done
+  printf '%s' "$max"
+}
+
+claim_owner_id=""
+
+recover_claim() {
+  local lock="$1" attempt="$2" owner pid start socket identity_status
+  owner="$(read_state_field "$lock/owner" owner_id)"
+  if [ -z "$owner" ]; then
+    [ "$attempt" -ge 3 ] || return 1
+    if [ -f "$lock/owner" ] && [ -z "$(read_state_field "$lock/owner" owner_id)" ]; then
+      rm -f "$lock/owner" 2>/dev/null
+    fi
+    rmdir "$lock" 2>/dev/null || true
+    return 1
+  fi
+  pid="$(record_number "$lock/owner" pid)"
+  start="$(read_state_field "$lock/owner" process_start)"
+  socket="$(read_state_field "$lock/owner" socket_path)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    if [ "$socket" = "$SOCKET_PATH" ]; then
+      process_start_matches "$pid" "$start"
+      identity_status=$?
+      [ "$identity_status" -eq 1 ] || return 1
+    fi
+  fi
+  [ "$(read_state_field "$lock/owner" owner_id)" = "$owner" ] || return 1
+  rm -f "$lock/owner" 2>/dev/null
+  rmdir "$lock" 2>/dev/null || true
+  return 0
+}
+
+acquire_claim() {
+  local lock="$1" attempts="$2" attempt=0 owner start owner_record
+  while [ "$attempt" -lt "$attempts" ]; do
+    attempt=$((attempt + 1))
+    if mkdir "$lock" 2>/dev/null; then
+      owner="$$.$RANDOM.$(now_seq)"
+      start="$(process_start_marker "$$")" || {
+        rmdir "$lock" 2>/dev/null || true
+        return 1
+      }
+      owner_record="owner_id=$(encode_value "$owner")
+pid=$$
+process_start=$(encode_value "$start")
+socket_path=$(encode_value "$SOCKET_PATH")"
+      if ! atomic_write "$lock/owner" "$owner_record"; then
+        rmdir "$lock" 2>/dev/null || true
+        return 1
+      fi
+      claim_owner_id="$owner"
+      return 0
+    fi
+    recover_claim "$lock" "$attempt" || true
+    sleep 0.01
+  done
+  return 1
+}
+
+release_claim() {
+  local lock="$1" owner="$2"
+  [ -n "$owner" ] || return 0
+  [ "$(read_state_field "$lock/owner" owner_id)" = "$owner" ] || return 0
+  rm -f "$lock/owner" 2>/dev/null
+  rmdir "$lock" 2>/dev/null || true
+}
+
+initialize_namespace() {
+  local namespace socket_record reconcile_record
+  namespace="$(namespace_dir)" || return 1
+  mkdir -p "$namespace/panes" 2>/dev/null || return 1
+  socket_record="socket_path=$(encode_value "$SOCKET_PATH")"
+  [ -f "$namespace/socket.state" ] || atomic_write "$namespace/socket.state" "$socket_record" || return 1
+  reconcile_record="pending_generation=0
+completed_generation=0
+location_metadata_high_water=0
+checkout_root=$(encode_value "")
+repository_anchor=$(encode_value "")
+retained_location=$(encode_value "")"
+  [ -f "$namespace/reconcile.state" ] || \
+    atomic_write "$namespace/reconcile.state" "$reconcile_record" || return 1
+  return 0
+}
+
+# ------------------------------------------------------------------- guards
+
+command -v herdr >/dev/null 2>&1 || exit 0
+
+# ---------------------------------------------------------------- presentation
+
+read_state_field() {
+  # One in-process scan instead of grep|cut. resolve_pane_location reads seven
+  # fields per pane and location_state_matches eight, so the old form grepped a
+  # ten-line file fifteen times per pane. Keys are literal identifiers, so
+  # dropping grep's regex semantics is not observable, and the trailing
+  # `|| [ -n "$line" ]` keeps a final line that has no newline.
+  local file="$1" key="$2" line encoded=""
+  [ -f "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "${key}="*) encoded="${line#*=}"; break ;;
+    esac
+  done < "$file" 2>/dev/null
+  [ -n "$encoded" ] || return 0
+  printf '%s' "$encoded" | base64 -d 2>/dev/null || true
+}
+
+write_reconcile_state() {
+  local file="$1" pending="$2" completed="$3" location_metadata="$4"
+  local checkout_root="$5" repository_anchor="$6" retained_location="$7" content
+  content="pending_generation=$pending
+completed_generation=$completed
+location_metadata_high_water=$location_metadata
+checkout_root=$(encode_value "$checkout_root")
+repository_anchor=$(encode_value "$repository_anchor")
+retained_location=$(encode_value "$retained_location")"
+  atomic_write "$file" "$content"
+}
+
+# A pane label opens with a short agent prefix, so several labels still fit
+# in the tab label. Plain ASCII on purpose: the earlier Nerd Font glyph badges
+# rendered as empty boxes on any terminal without a patched font. An agent
+# with no prefix of its own falls back to its first letter.
+pane_label() {
+  local name="$1" slug="$2"
+  case "$name" in
+    claude) printf 'cc:%s' "$slug"; return 0 ;;
+    opencode) printf 'oc:%s' "$slug"; return 0 ;;
+    pi) printf 'pi:%s' "$slug"; return 0 ;;
+    codex) printf 'cx:%s' "$slug"; return 0 ;;
+  esac
+  printf '%s:%s' \
+    "$(LC_ALL=C printf '%s' "$name" | cut -c1 | tr '[:upper:]' '[:lower:]')" \
+    "$slug"
+}
+
+# A pane running no agent is named after its command. The name comes from the
+# leader of the foreground process group, never from the first entry of the
+# list: the list runs from children up to the leader, so `bun run dev` reports
+# a `node` child first and only the leader carries the command as typed.
+#
+# A pane whose foreground process group is the shell itself sits idle and gets
+# no name. Arguments that start with `-` or `/` are dropped, because a flag or
+# a path says nothing at a glance and eats the whole width.
+pane_process_label() {
+  local target="$1" info
+  info="$(herdr pane process-info --pane "$target" 2>/dev/null)" || return 0
+  [ -n "$info" ] || return 0
+  printf '%s' "$info" | jq -r --argjson max "$PROC_LABEL_MAX_LEN" '
+    def base: sub(".*/"; "");
+    .result.process_info as $i
+    | select($i.foreground_process_group_id != $i.shell_pid)
+    | [$i.foreground_processes[]? | select(.pid == $i.foreground_process_group_id)][0]
+    | select(. != null)
+    | ((.argv // []) | if length == 0 then [(.argv0 // .name // "")] else . end) as $argv
+    | ([($argv[0] // "") | base] + [$argv[1:3][] | select(test("^[-/]") | not)])
+    | join(" ")
+    | select(. != "")
+    | if (length > $max) then (.[0:$max - 1] + "…") else . end
+  ' 2>/dev/null
+}
+
+location_state_file() {
+  printf '%s/panes/%s/location.state' "$(namespace_dir)" "$(encode_key "$1")"
+}
+
+write_location_state() {
+  local file="$1" pane_id="$2" terminal="$3" root="$4" anchor="$5" repo="$6" branch="$7"
+  local is_linked="$8" sha="$9" content
+  content="pane=$(encode_value "$pane_id")
+terminal_id=$(encode_value "$terminal")
+checkout_root=$(encode_value "$root")
+repository_anchor=$(encode_value "$anchor")
+repo=$(encode_value "$repo")
+branch=$(encode_value "$branch")
+is_linked=$(encode_value "$is_linked")
+sha=$(encode_value "$sha")"
+  atomic_write "$file" "$content"
+}
+
+location_state_matches() {
+  local file="$1" pane_id="$2" terminal="$3" root="$4" anchor="$5" repo="$6" branch="$7"
+  local is_linked="$8" sha="$9"
+  [ "$(read_state_field "$file" pane)" = "$pane_id" ] &&
+    [ "$(read_state_field "$file" terminal_id)" = "$terminal" ] &&
+    [ "$(read_state_field "$file" checkout_root)" = "$root" ] &&
+    [ "$(read_state_field "$file" repository_anchor)" = "$anchor" ] &&
+    [ "$(read_state_field "$file" repo)" = "$repo" ] &&
+    [ "$(read_state_field "$file" branch)" = "$branch" ] &&
+    [ "$(read_state_field "$file" is_linked)" = "$is_linked" ] &&
+    [ "$(read_state_field "$file" sha)" = "$sha" ]
+}
+
+text_length() {
+  printf '%s' "$1" | LC_ALL="$TEXT_LOCALE" wc -m | tr -d '[:space:]'
+}
+
+text_prefix() {
+  [ "$2" -gt 0 ] || return 0
+  printf '%s' "$1" | LC_ALL="$TEXT_LOCALE" cut -c "1-$2"
+}
+
+admin_checkout_for_path() {
+  local path="$1" cursor gitdir candidate
+  (cd "$path" 2>/dev/null) || return 1
+  cursor="${path%/}"
+  while [ -n "$cursor" ]; do
+    if [ -f "$cursor/gitdir" ]; then
+      gitdir="$(sed -n '1p' "$cursor/gitdir" 2>/dev/null)"
+      case "$gitdir" in
+        /*/.git) candidate="${gitdir%/.git}" ;;
+        *) candidate="" ;;
+      esac
+      if [ -n "$candidate" ] && [ -d "$candidate" ]; then
+        printf '%s' "$candidate"
+        return 0
+      fi
+      return 1
+    fi
+    if [ "${cursor##*/}" = ".git" ] && [ -d "${cursor%/.git}" ]; then
+      printf '%s' "${cursor%/.git}"
+      return 0
+    fi
+    [ "$cursor" != "/" ] || break
+    cursor="${cursor%/*}"
+    [ -n "$cursor" ] || cursor="/"
+  done
+  return 1
+}
+
+run_budgeted_command() {
+  run_budgeted_command_within "$LOCATION_GIT_BUDGET" "$@"
+}
+
+run_budgeted_command_within() {
+  local budget="$1" outfile="$2" errfile="$3"
+  shift 3
+  "$@" </dev/null >"$outfile" 2>"$errfile" &
+  local command_pid=$!
+  ( sleep "$budget"; kill -9 "$command_pid" ) >/dev/null 2>&1 &
+  local watchdog=$! status=0
+  wait "$command_pid" || status=$?
+  kill "$watchdog" >/dev/null 2>&1 || true
+  wait "$watchdog" 2>/dev/null || true
+  return "$status"
+}
+
+repository_name() {
+  local anchor="$1" parent
+  if [ "${anchor##*/}" = ".git" ]; then
+    parent="${anchor%/.git}"
+    printf '%s' "${parent##*/}"
+  else
+    printf '%s' "${anchor##*/}"
+  fi
+}
+
+transient_location_result() {
+  printf 'transient\037%s\037%s\037%s\037%s\037%s\037%s' "$1" "$2" "$3" "$4" "$5" "$6"
+}
+
+# Prints resolve_pane_location's retained-evidence early exit from the
+# caller's prior_* locals (bash dynamic scoping).
+bail_transient() {
+  transient_location_result "$prior_root" "$prior_anchor" "$prior_repo" "$prior_branch" "$prior_is_linked" "$prior_sha"
+}
+
+authoritative_worktree_deleted() {
+  local root="$1" anchor="$2" outfile errfile status
+  [ -n "$root" ] && [ -n "$anchor" ] && [ -d "$anchor" ] || return 1
+  outfile="$(mktemp "$(namespace_dir)/.worktrees.XXXXXX" 2>/dev/null)" || return 1
+  errfile="$outfile.err"
+  if run_budgeted_command "$outfile" "$errfile" \
+    env LC_ALL=C git --git-dir="$anchor" worktree list --porcelain; then
+    status=0
+  else
+    status=$?
+  fi
+  if [ "$status" -eq 0 ] && grep -q '^worktree ' "$outfile" 2>/dev/null && \
+    ! grep -Fqx "worktree $root" "$outfile" 2>/dev/null; then
+    rm -f "$outfile" "$errfile"
+    return 0
+  fi
+  rm -f "$outfile" "$errfile"
+  return 1
+}
+
+# Prints outcome, canonical checkout root, common Git directory, repository,
+# symbolic branch, linked-worktree flag, and detached short SHA separated by
+# unit separators. A transient result carries retained evidence when one
+# exists; confirmed non-Git carries the probed directory in the root field and
+# nothing else — outside a checkout the directory name is the only thing a pane
+# can report, and it is the sole reason that field is populated for non-Git.
+resolve_pane_location() {
+  local pane_json="$1" state_file="$2" has_agent has_foreground cwd prior_root prior_anchor
+  local prior_repo prior_branch prior_is_linked prior_sha candidate outfile errfile status
+  local root anchor branch repo lines is_linked sha sha_outfile sha_errfile
+  local pane_terminal prior_terminal
+  prior_root="$(read_state_field "$state_file" checkout_root)"
+  prior_anchor="$(read_state_field "$state_file" repository_anchor)"
+  prior_repo="$(read_state_field "$state_file" repo)"
+  prior_branch="$(read_state_field "$state_file" branch)"
+  prior_is_linked="$(read_state_field "$state_file" is_linked)"
+  prior_sha="$(read_state_field "$state_file" sha)"
+  prior_terminal="$(read_state_field "$state_file" terminal_id)"
+  pane_terminal="$(printf '%s' "$pane_json" | jq -r '.terminal_id // ""' 2>/dev/null)"
+  # A pane ID reused for a new terminal must not inherit the prior occupant's
+  # retained Git location through a transient probe; only the terminal that
+  # wrote this evidence may have it played back. A record with no terminal_id
+  # at all (e.g. migrated from the retired pre-cutover engine) is unverifiable
+  # and treated the same as a mismatch.
+  if [ "$prior_terminal" != "$pane_terminal" ]; then
+    prior_root=""; prior_anchor=""; prior_repo=""; prior_branch=""; prior_is_linked=""; prior_sha=""
+  fi
+  has_agent="$(printf '%s' "$pane_json" | jq -r '(.agent // "") != ""' 2>/dev/null)"
+  has_foreground="$(printf '%s' "$pane_json" | jq -r 'has("foreground_cwd")' 2>/dev/null)"
+  if [ "$has_agent" != "true" ] && [ "$has_foreground" = "true" ]; then
+    cwd="$(printf '%s' "$pane_json" | jq -r 'if (.foreground_cwd | type) == "string" then .foreground_cwd else "" end' 2>/dev/null)"
+  else
+    cwd="$(printf '%s' "$pane_json" | jq -r 'if (.cwd | type) == "string" then .cwd else "" end' 2>/dev/null)"
+  fi
+
+  if [ -z "$cwd" ] || ! (cd "$cwd" 2>/dev/null); then
+    if authoritative_worktree_deleted "$prior_root" "$prior_anchor"; then
+      printf 'non_git\037\037\037\037\037\037'
+    else
+      bail_transient
+    fi
+    return 0
+  fi
+
+  candidate="$cwd"
+  case "$cwd" in
+    */.git | */.git/*)
+      candidate="$(admin_checkout_for_path "$cwd" 2>/dev/null)" || {
+        bail_transient
+        return 0
+      }
+      ;;
+  esac
+  command -v git >/dev/null 2>&1 || {
+    bail_transient
+    return 0
+  }
+  outfile="$(mktemp "$(namespace_dir)/.git-location.XXXXXX" 2>/dev/null)" || {
+    bail_transient
+    return 0
+  }
+  errfile="$outfile.err"
+  if run_budgeted_command "$outfile" "$errfile" env LC_ALL=C git -C "$candidate" rev-parse \
+    --path-format=absolute --show-toplevel --git-common-dir --symbolic-full-name HEAD; then
+    status=0
+  else
+    status=$?
+  fi
+  if [ "$status" -ne 0 ]; then
+    if { [ "$status" -eq 1 ] || [ "$status" -eq 128 ]; } && \
+      grep -Eqi 'not a git repository|not inside a work tree' "$errfile" 2>/dev/null; then
+      rm -f "$outfile" "$errfile"
+      printf 'non_git\037%s\037\037\037\037\037' "$cwd"
+    else
+      rm -f "$outfile" "$errfile"
+      bail_transient
+    fi
+    return 0
+  fi
+  lines="$(wc -l < "$outfile" | tr -d '[:space:]')"
+  branch="$(sed -n '3p' "$outfile")"
+  # Real git cannot mix symbolic and --short output in one rev-parse call and
+  # always answers the first probe with exactly 3 lines, so only a detached
+  # HEAD (literal HEAD on line 3) pays for a second budgeted call to fetch
+  # the fourth line — the 7-char short SHA. Panes on a branch never need it.
+  # The test probe emits all four lines in one call.
+  if [ "$lines" = 3 ] && [ "$branch" = "HEAD" ]; then
+    sha_outfile="$(mktemp "$(namespace_dir)/.git-location.XXXXXX" 2>/dev/null)"
+    if [ -n "$sha_outfile" ]; then
+      sha_errfile="$sha_outfile.err"
+      if run_budgeted_command "$sha_outfile" "$sha_errfile" \
+        env LC_ALL=C git -C "$candidate" rev-parse --short=7 HEAD; then
+        cat "$sha_outfile" >> "$outfile" 2>/dev/null
+      fi
+      rm -f "$sha_outfile" "$sha_errfile"
+    fi
+  fi
+  root="$(sed -n '1p' "$outfile")"
+  anchor="$(sed -n '2p' "$outfile")"
+  sha="$(sed -n '4p' "$outfile")"
+  rm -f "$outfile" "$errfile"
+  if [ -z "$root" ] || [ -z "$anchor" ] || [ -z "$branch" ]; then
+    bail_transient
+    return 0
+  fi
+  case "$branch" in
+    refs/heads/*)
+      # On a branch the branch is the ref; the SHA line is probe transport
+      # only and never becomes state, so a commit does not churn the record.
+      branch="${branch#refs/heads/}"
+      sha=""
+      ;;
+    HEAD)
+      # Detached HEAD keeps the location: the short SHA becomes the ref.
+      branch=""
+      case "$sha" in
+        *[!0-9a-f]* | '')
+          bail_transient
+          return 0
+          ;;
+      esac
+      ;;
+    *)
+      bail_transient
+      return 0
+      ;;
+  esac
+  repo="$(repository_name "$anchor")"
+  [ -n "$repo" ] || {
+    bail_transient
+    return 0
+  }
+  # A linked worktree carries a .git FILE at the checkout root; the main
+  # checkout has a .git directory. Submodule roots also carry a .git file and
+  # read as linked — accepted: a pane parked at a submodule root genuinely is
+  # not in the main checkout.
+  is_linked=""
+  [ ! -f "$root/.git" ] || is_linked=1
+  printf 'git\037%s\037%s\037%s\037%s\037%s\037%s' "$root" "$anchor" "$repo" "$branch" "$is_linked" "$sha"
+}
+
+deterministic_digest() {
+  local value="$1" file="${HERDR_PANE_LABELS_TEST_DIGEST_FILE:-}" digest round checksum
+  if [ -n "$file" ] && [ -f "$file" ]; then
+    digest="$(table_value_for "$value" "$(cat "$file" 2>/dev/null)")"
+    if [ -n "$digest" ]; then
+      printf '%s' "$digest"
+      return 0
+    fi
+  fi
+  digest=""
+  round=0
+  while [ "$round" -lt 4 ]; do
+    checksum="$(printf '%s:%s' "$round" "$value" | cksum | awk '{printf "%08x", $1}')"
+    digest="$digest$checksum"
+    round=$((round + 1))
+  done
+  printf '%s' "$digest"
+}
+
+token_is_taken() {
+  local token="$1" mappings="$2" _root existing
+  while IFS="$FIELD_SEPARATOR" read -r _root existing; do
+    [ -n "$existing" ] || continue
+    [ "$existing" != "$token" ] || return 0
+  done <<EOF
+$mappings
+EOF
+  return 1
+}
+
+# One awk pass over the whole root list, replacing the per-pair rescan that
+# forked once per comparison. It re-emits every row in input order, annotated
+# with how many rows share its basename and with the shallowest suffix of at
+# least two components that no other distinct root shares -- empty when every
+# depth collides. Distinctness matches the rescan it replaces: two identical
+# root strings never disqualify each other's suffix, while the basename count
+# still counts every row.
+worktree_root_analysis() {
+  printf '%s\n' "$1" | awk -F/ -v sep="$FIELD_SEPARATOR" '
+    $0 == "" { next }
+    {
+      rows[++row_count] = $0
+      row_base[row_count] = $NF
+      base_rows[$NF]++
+      if (!($0 in seen)) {
+        seen[$0] = 1
+        distinct[++distinct_count] = $0
+        fields[distinct_count] = NF
+        for (depth = 2; depth <= NF; depth++) {
+          suffix = $(NF - depth + 1)
+          for (part = NF - depth + 2; part <= NF; part++) suffix = suffix "/" $part
+          suffixes[distinct_count, depth] = suffix
+          sharing[depth, suffix]++
+        }
+      }
+    }
+    END {
+      for (index_ = 1; index_ <= distinct_count; index_++) {
+        chosen = ""
+        for (depth = 2; depth <= fields[index_]; depth++) {
+          if (sharing[depth, suffixes[index_, depth]] == 1) {
+            chosen = suffixes[index_, depth]
+            break
+          }
+        }
+        chosen_for[distinct[index_]] = chosen
+      }
+      for (index_ = 1; index_ <= row_count; index_++) {
+        printf "%s%s%s%s%s\n", rows[index_], sep, base_rows[row_base[index_]], \
+          sep, chosen_for[rows[index_]]
+      }
+    }
+  '
+}
+
+build_worktree_tokens() {
+  local roots="$1" mappings="" analysis root base candidate suffix base_matches
+  local digest digest_len fragment_len ordinal=0 ordinal_hex ordinal_stem
+  analysis="$(worktree_root_analysis "$roots")"
+  while IFS="$FIELD_SEPARATOR" read -r root base_matches suffix; do
+    [ -n "$root" ] || continue
+    ordinal=$((ordinal + 1))
+    base="${root##*/}"
+    candidate=""
+    if [ "$base_matches" -eq 1 ] && [ "$(text_length "$base")" -le "$WORKTREE_TOKEN_MAX_LEN" ]; then
+      candidate="$base"
+    elif [ "$base_matches" -gt 1 ] && [ -n "$suffix" ]; then
+      [ "$(text_length "$suffix")" -le "$WORKTREE_TOKEN_MAX_LEN" ] && candidate="$suffix"
+    fi
+    if [ -n "$candidate" ] && token_is_taken "$candidate" "$mappings"; then candidate=""; fi
+    if [ -z "$candidate" ]; then
+      digest="$(deterministic_digest "$root")"
+      digest_len=6
+      while [ "$digest_len" -le 16 ]; do
+        fragment_len=$((WORKTREE_TOKEN_MAX_LEN - digest_len - 1))
+        candidate="$(text_prefix "$base" "$fragment_len")~$(text_prefix "$digest" "$digest_len")"
+        token_is_taken "$candidate" "$mappings" || break
+        candidate=""
+        digest_len=$((digest_len + 1))
+      done
+      if [ -z "$candidate" ]; then
+        # Neither prefix depends on the ordinal, so the retry loop reuses them.
+        ordinal_stem="$(text_prefix "$base" 1)~$(text_prefix "$digest" 12)"
+        ordinal_hex="$(printf '%04x' "$ordinal")"
+        candidate="${ordinal_stem}${ordinal_hex}"
+        while token_is_taken "$candidate" "$mappings"; do
+          ordinal=$((ordinal + 1))
+          ordinal_hex="$(printf '%04x' "$ordinal")"
+          candidate="${ordinal_stem}${ordinal_hex}"
+        done
+      fi
+    fi
+    mappings="${mappings}${mappings:+
+}${root}${FIELD_SEPARATOR}${candidate}"
+  done <<EOF
+$analysis
+EOF
+  printf '%s' "$mappings"
+}
+
+# Membership test over a newline-joined list. Used for pane sets that are
+# read straight off the snapshot rather than carried in a presentation record.
+list_contains_line() {
+  local wanted="$1" list="$2" line
+  while IFS= read -r line; do
+    [ "$line" != "$wanted" ] || return 0
+  done <<EOF
+$list
+EOF
+  return 1
+}
+
+# Look up the value column of a FIELD_SEPARATOR-joined two-column table
+# (key␟value rows). Serves worktree tokens and workspace names alike.
+table_value_for() {
+  local wanted="$1" table="$2" key value
+  while IFS="$FIELD_SEPARATOR" read -r key value; do
+    if [ "$key" = "$wanted" ]; then
+      printf '%s' "$value"
+      return 0
+    fi
+  done <<EOF
+$table
+EOF
+}
+
+# Like table_value_for, but returns the whole value row: every column after
+# the key, still FIELD_SEPARATOR-joined. `read` leaves the remainder of the
+# line in its last variable, separators included.
+table_row_for() {
+  local wanted="$1" table="$2" key rest
+  while IFS="$FIELD_SEPARATOR" read -r key rest; do
+    if [ "$key" = "$wanted" ]; then
+      printf '%s' "$rest"
+      return 0
+    fi
+  done <<EOF
+$table
+EOF
+}
+
+# Positional record streams are only safe while every row carries exactly the
+# width its consumers expect. A field that smuggles in a FIELD_SEPARATOR or a
+# newline shifts every later field and surfaces as a wrong label, not as a
+# crash. Reject the entire stream on one malformed row or cardinality mismatch;
+# silently dropping a row would let a partial presentation pass commit.
+filter_records_of_width() {
+  awk -F "$FIELD_SEPARATOR" -v expected="$1" -v exact="${2:-}" '
+    NF == 0 { next }
+    NF == expected { valid++; print; next }
+    {
+      invalid = 1
+      printf "herdr-pane-labels: rejected %d-field record (expected %d)\n", NF, expected > "/dev/stderr"
+    }
+    END {
+      if (exact != "" && valid != exact) {
+        invalid = 1
+        printf "herdr-pane-labels: rejected %d-record stream (expected %d)\n", valid, exact > "/dev/stderr"
+      }
+      exit invalid
+    }
+  '
+}
+
+# One formatter for every surface:
+#   $git_ref = <place-icon> <ref> [<folder-icon> <folder>] [<stale-icon>]
+# place is "branch" (main checkout), "worktree" (linked worktree), or
+# "commit" (detached HEAD); ref is the branch name or the detached short SHA.
+# The caller decides folder-qualifier suppression — it knows the pane's
+# workspace name. Ref-less retained evidence renders as folder icon + token.
+git_ref_for() {
+  local place="$1" ref="$2" folder="$3" status="$4" label=""
+  if [ -n "$ref" ]; then
+    case "$place" in
+      worktree) label="$ICON_WORKTREE $ref" ;;
+      commit) label="$ICON_COMMIT $ref" ;;
+      *) label="$ICON_BRANCH $ref" ;;
+    esac
+    [ -z "$folder" ] || label="$label $ICON_FOLDER $folder"
+  elif [ -n "$folder" ]; then
+    label="$ICON_FOLDER $folder"
+  else
+    return 0
+  fi
+  [ -z "$status" ] || label="$label $ICON_STALE"
+  printf '%s' "$label"
+}
+
+# Counts are volatile where identity is stable, so they get their own probe,
+# their own budget and their own outcome: a status timeout must never make a
+# space's branch lie. `fresh` carries the count bundle (empty when clean),
+# `stale` means the probe did not answer in budget, `absent` means there is
+# nothing to count.
+resolve_checkout_status() {
+  local root="$1" outfile errfile status counts pull push conflicts staged unstaged untracked
+  [ -n "$root" ] || { printf 'absent\037'; return 0; }
+  command -v git >/dev/null 2>&1 || { printf 'stale\037'; return 0; }
+  outfile="$(mktemp "$(namespace_dir)/.git-status.XXXXXX" 2>/dev/null)" || {
+    printf 'stale\037'
+    return 0
+  }
+  errfile="$outfile.err"
+  # One call answers both halves: the changed paths and, as `# branch.ab`, the
+  # ahead/behind pair. Two probes would cost a second process launch.
+  #
+  # `--untracked-files=all` is what makes the count mean the same thing on
+  # every machine: without it `status.showUntrackedFiles` can hide untracked
+  # paths entirely, or collapse a new directory to a single entry while
+  # tracked edits still count one per file.
+  if run_budgeted_command_within "$SPACE_STATUS_BUDGET" "$outfile" "$errfile" \
+    env LC_ALL=C git -C "$root" --no-optional-locks status --porcelain=v2 --branch \
+    --untracked-files=all; then
+    status=0
+  else
+    status=$?
+  fi
+  if [ "$status" -ne 0 ]; then
+    rm -f "$outfile" "$errfile"
+    printf 'stale\037'
+    return 0
+  fi
+  # Parse every category in one pass. For ordinary and renamed records, X is
+  # the staged state and Y is the unstaged state. A partially staged path
+  # intentionally increments both; unmerged paths get their own count only.
+  counts="$(awk '
+    /^# branch\.ab / { push = substr($3, 2) + 0; pull = substr($4, 2) + 0; next }
+    $1 == "u" { conflicts++; next }
+    $1 == "?" { untracked++; next }
+    $1 == "1" || $1 == "2" {
+      if (substr($2, 1, 1) != ".") staged++
+      if (substr($2, 2, 1) != ".") unstaged++
+    }
+    END { print pull + 0, push + 0, conflicts + 0, staged + 0, unstaged + 0, untracked + 0 }
+  ' "$outfile" 2>/dev/null)"
+  rm -f "$outfile" "$errfile"
+  IFS=' ' read -r pull push conflicts staged unstaged untracked <<EOF
+$counts
+EOF
+  printf 'fresh\037%s' "$(git_status_counts_for "$pull" "$push" "$conflicts" "$staged" "$unstaged" "$untracked")"
+}
+
+# Six independent values behind one separator, so an all-zero status stays
+# wholly empty and a caller can still join only the parts it wants.
+git_status_counts_for() {
+  local pull="$1" push="$2" conflicts="$3" staged="$4" unstaged="$5" untracked="$6"
+  local git_pull="" git_push="" git_conflicts="" git_staged="" git_unstaged="" git_untracked=""
+  case "$pull" in '' | *[!0-9]*) pull=0 ;; esac
+  case "$push" in '' | *[!0-9]*) push=0 ;; esac
+  case "$conflicts" in '' | *[!0-9]*) conflicts=0 ;; esac
+  case "$staged" in '' | *[!0-9]*) staged=0 ;; esac
+  case "$unstaged" in '' | *[!0-9]*) unstaged=0 ;; esac
+  case "$untracked" in '' | *[!0-9]*) untracked=0 ;; esac
+  [ "$pull" -eq 0 ] || git_pull="$ICON_PULL$pull"
+  [ "$push" -eq 0 ] || git_push="$ICON_PUSH$push"
+  [ "$conflicts" -eq 0 ] || git_conflicts="$ICON_CONFLICT$conflicts"
+  [ "$staged" -eq 0 ] || git_staged="$ICON_STAGED$staged"
+  [ "$unstaged" -eq 0 ] || git_unstaged="$ICON_UNSTAGED$unstaged"
+  [ "$untracked" -eq 0 ] || git_untracked="$ICON_UNTRACKED$untracked"
+  [ -n "$git_pull$git_push$git_conflicts$git_staged$git_unstaged$git_untracked" ] || return 0
+  printf '%s\036%s\036%s\036%s\036%s\036%s' \
+    "$git_pull" "$git_push" "$git_conflicts" "$git_staged" "$git_unstaged" "$git_untracked"
+}
+
+# The space row renders one string, so the bundle joins on a single space in a
+# fixed order and empty positions simply disappear.
+status_line_for() {
+  local status="$1" pull push conflicts staged unstaged untracked line="" value
+  IFS="$STATUS_SEPARATOR" read -r pull push conflicts staged unstaged untracked <<EOF
+$status
+EOF
+  for value in "$pull" "$push" "$conflicts" "$staged" "$unstaged" "$untracked"; do
+    [ -n "$value" ] || continue
+    if [ -z "$line" ]; then line="$value"; else line="$line $value"; fi
+  done
+  printf '%s' "$line"
+}
+
+# Spaces routinely share a checkout, so the probe runs once per distinct root
+# rather than once per space, and distinct roots run concurrently: several slow
+# checkouts cost one status budget rather than one budget each.
+build_root_statuses() {
+  local roots="$1" table="" root result_file status_pid
+  local status_pids="" status_results="" status_child_failed=0
+  while IFS= read -r root; do
+    [ -n "$root" ] || continue
+    result_file="$(umask 077; mktemp "$(namespace_dir)/.status-result.XXXXXX" 2>/dev/null)" || {
+      status_child_failed=1
+      break
+    }
+    (
+      printf '%s%s' "$root" "$FIELD_SEPARATOR"
+      resolve_checkout_status "$root"
+    ) > "$result_file" &
+    status_pids="${status_pids}${status_pids:+
+}$!"
+    status_results="${status_results}${status_results:+
+}$result_file"
+  done <<EOF
+$roots
+EOF
+  while IFS= read -r status_pid; do
+    [ -n "$status_pid" ] || continue
+    wait "$status_pid" 2>/dev/null || status_child_failed=1
+  done <<EOF
+$status_pids
+EOF
+  while IFS= read -r result_file; do
+    [ -n "$result_file" ] || continue
+    [ "$status_child_failed" -eq 1 ] || table="${table}${table:+
+}$(cat "$result_file" 2>/dev/null)"
+    rm -f "$result_file"
+  done <<EOF
+$status_results
+EOF
+  [ "$status_child_failed" -eq 0 ] || return 1
+  printf '%s' "$table"
+}
+
+snapshot_is_complete() {
+  jq -e '
+    def safe_string:
+      type == "string" and (test("[\u0000-\u001f\u007f]") | not);
+    def nonempty_string: safe_string and length > 0;
+    def optional_safe_string: . == null or safe_string;
+    def safe_tokens:
+      ((.tokens // {}) | type) == "object" and
+      ((.tokens // {}) |
+        all([.repo,.worktree,.branch,.location_status,.git_ref,.space_origin,.location_label][];
+          optional_safe_string));
+    def finite_number: type == "number" and (tostring | test("nan|infinite"; "i") | not);
+    def optional_session:
+      (has("agent_session") | not) or
+      (.agent_session == null) or
+      ((.agent_session | type) == "object" and
+       (.agent_session.agent | nonempty_string) and
+       (.agent_session.kind | nonempty_string) and
+       (.agent_session.source | nonempty_string) and
+       (.agent_session.value | nonempty_string) and
+       ([.agent_session | .. | strings] | all(.[]; safe_string)));
+    .result.snapshot as $s
+    | ($s | type) == "object"
+      and ($s.panes | type) == "array"
+      and ($s.tabs | type) == "array"
+      and ($s.agents | type) == "array"
+      and ($s.layouts | type) == "array"
+      and ($s.workspaces | type) == "array"
+      and all($s.panes[];
+        (.pane_id | nonempty_string) and (.terminal_id | nonempty_string) and
+        (.tab_id | nonempty_string) and (.workspace_id | nonempty_string) and
+        # herdr omits `label` until a pane is first renamed, and this engine is
+        # the only label writer: rejecting the null would deadlock every fresh
+        # pane out of the pipeline.
+        (.revision | finite_number) and (.label == null or (.label | safe_string)) and
+        ((has("agent") | not) or .agent == null or (.agent | nonempty_string)) and
+        ((has("cwd") | not) or (.cwd | optional_safe_string)) and
+        ((has("foreground_cwd") | not) or (.foreground_cwd | optional_safe_string)) and
+        safe_tokens and optional_session)
+      and all($s.tabs[];
+        (.tab_id | nonempty_string) and (.workspace_id | nonempty_string) and
+        (.label | safe_string))
+      and all($s.workspaces[];
+        (.workspace_id | nonempty_string) and
+        (((.tokens // {}) | type) == "object") and
+        ((.tokens // {}) | all([.branch, .git_status][]; optional_safe_string)) and
+        ((has("label") | not) or (.label | optional_safe_string)) and
+        ((has("name") | not) or (.name | optional_safe_string)))
+      and all($s.agents[];
+        (.pane_id | nonempty_string) and (.agent | nonempty_string) and
+        (.terminal_id | nonempty_string) and (.revision | finite_number) and
+        (.state_change_seq | finite_number) and
+        ((has("tab_id") | not) or .tab_id == null or (.tab_id | nonempty_string)) and
+        ((has("workspace_id") | not) or .workspace_id == null or (.workspace_id | nonempty_string)) and
+        ((has("name") | not) or (.name | nonempty_string)) and optional_session)
+      and (($s.panes | map(.pane_id) | length) == ($s.panes | map(.pane_id) | unique | length))
+      and (($s.panes | map(.terminal_id) | length) == ($s.panes | map(.terminal_id) | unique | length))
+      and (($s.tabs | map(.tab_id) | length) == ($s.tabs | map(.tab_id) | unique | length))
+      and (($s.workspaces | map(.workspace_id) | length) == ($s.workspaces | map(.workspace_id) | unique | length))
+      and (($s.agents | map(.pane_id) | length) == ($s.agents | map(.pane_id) | unique | length))
+      and (($s.agents | map(.terminal_id) | length) == ($s.agents | map(.terminal_id) | unique | length))
+      and (($s.agents | map(select(has("name")) | .name) | length) ==
+           ($s.agents | map(select(has("name")) | .name) | unique | length))
+      and all($s.panes[]; . as $p |
+        ([$s.tabs[] | select(.tab_id == $p.tab_id and .workspace_id == $p.workspace_id)] | length) == 1)
+      and all($s.tabs[]; . as $t |
+        ([$s.workspaces[] | select(.workspace_id == $t.workspace_id)] | length) == 1)
+      and all($s.panes[]; . as $p |
+        if (($p.agent // "") != "") then
+          ([$s.agents[] | select(.pane_id == $p.pane_id)] | length) == 1 and
+          ([$s.agents[] | select(.pane_id == $p.pane_id)][0] as $a |
+            $a.agent == $p.agent and $a.terminal_id == $p.terminal_id and
+            ((($a.tab_id // $p.tab_id) == $p.tab_id)) and
+            ((($a.workspace_id // $p.workspace_id) == $p.workspace_id)) and
+            ((($a.agent_session // null) == ($p.agent_session // null))))
+        else ([$s.agents[] | select(.pane_id == $p.pane_id)] | length) == 0 end)
+      and all($s.agents[]; . as $a |
+        ([$s.panes[] | select(.pane_id == $a.pane_id and (.agent // "") == $a.agent and
+          .terminal_id == $a.terminal_id)] | length) == 1)
+  ' >/dev/null 2>&1
+}
+
+read_complete_snapshot() {
+  local snapshot
+  snapshot="$(herdr api snapshot 2>/dev/null)" || return 1
+  if ! printf '%s' "$snapshot" | snapshot_is_complete; then
+    if [ -n "${HERDR_PANE_LABELS_TEST_TRACE_FILE:-}" ]; then
+      printf '%s\n' snapshot-invalid >> "$HERDR_PANE_LABELS_TEST_TRACE_FILE"
+      printf '%s\n' "$snapshot" >> "$HERDR_PANE_LABELS_TEST_TRACE_FILE"
+    fi
+    return 1
+  fi
+  printf '%s' "$snapshot"
+}
+
+snapshot_identity() {
+  jq -cS '
+    .result.snapshot as $s
+    | {panes: [$s.panes[] | {pane_id,terminal_id,tab_id,workspace_id,agent,agent_session,revision}],
+       tabs: [$s.tabs[] | {tab_id,workspace_id}],
+       agents: [$s.agents[] | {pane_id,agent,terminal_id,tab_id,workspace_id,agent_session,revision,state_change_seq,name}]}
+  ' 2>/dev/null
+}
+
+agent_identity_for_pane() {
+  local pane_id="$1"
+  jq -cS --arg pane "$pane_id" '
+    .result.snapshot.agents[] | select(.pane_id == $pane)
+    | {pane_id,agent,terminal_id,tab_id,workspace_id,agent_session,revision,state_change_seq,name}
+  ' 2>/dev/null
+}
+
+agent_name_for_pane() {
+  local pane_id="$1"
+  jq -r --arg pane "$pane_id" '
+    .result.snapshot.agents[] | select(.pane_id == $pane) | .name // ""
+  ' 2>/dev/null
+}
+
+snapshot_aliases_in_pool() {
+  local snapshot="$1" pool_json="$2"
+  printf '%s' "$snapshot" | jq -e --argjson pool "$pool_json" '
+    all(.result.snapshot.agents[]; . as $agent |
+      has("name") and ($pool | index($agent.name) != null))
+  ' >/dev/null
+}
+
+rename_agent_from_snapshot() {
+  local snapshot="$1" pane_id="$2" expected seed candidate occupied_names fresh current
+  local output status code owner output_file
+  expected="$(printf '%s' "$snapshot" | agent_identity_for_pane "$pane_id")"
+  [ -n "$expected" ] || return 1
+  seed="$(printf '%s' "$expected" | jq -r --arg socket "$SOCKET_PATH" '
+    [$socket,.pane_id,.agent,.terminal_id,(.revision|tostring),(.state_change_seq|tostring),
+     (.agent_session.value // "")] | join("\u001f")')"
+  occupied_names="$(printf '%s' "$snapshot" | jq -r '.result.snapshot.agents[] | .name // empty')"
+
+  while IFS= read -r candidate; do
+    list_contains_line "$candidate" "$occupied_names" && continue
+
+    fresh="$(read_complete_snapshot)" || return 1
+    current="$(printf '%s' "$fresh" | agent_identity_for_pane "$pane_id")"
+    [ "$current" = "$expected" ] || return 2
+    snapshot="$fresh"
+    occupied_names="$(printf '%s' "$snapshot" | jq -r '.result.snapshot.agents[] | .name // empty')"
+    list_contains_line "$candidate" "$occupied_names" && continue
+
+    output_file="$(umask 077; mktemp "$(namespace_dir)/.agent-rename.XXXXXX" 2>/dev/null)" || return 1
+    if herdr agent rename "$pane_id" "$candidate" >"$output_file" 2>&1; then
+      rm -f "$output_file"
+      fresh="$(read_complete_snapshot)" || return 1
+      [ "$(printf '%s' "$fresh" | agent_name_for_pane "$pane_id")" = "$candidate" ] || return 1
+      printf '%s' "$fresh"
+      return 0
+    else
+      status=$?
+    fi
+    output="$(cat "$output_file" 2>/dev/null)"
+    rm -f "$output_file"
+    code="$(printf '%s' "$output" | jq -er 'select(type == "object") | .error.code' 2>/dev/null)" || code=""
+    [ "$status" -ne 0 ] || return 1
+    [ "$code" = "agent_name_taken" ] || return 1
+    fresh="$(read_complete_snapshot)" || return 1
+    current="$(printf '%s' "$fresh" | agent_identity_for_pane "$pane_id")"
+    [ "$current" = "$expected" ] || return 1
+    owner="$(printf '%s' "$fresh" | jq -r --arg name "$candidate" --arg pane "$pane_id" '
+      [.result.snapshot.agents[] | select((.name // "") == $name and .pane_id != $pane)] | length')"
+    [ "$owner" -eq 1 ] || return 1
+    snapshot="$fresh"
+    occupied_names="$(printf '%s' "$snapshot" | jq -r '.result.snapshot.agents[] | .name // empty')"
+  done < <(herdr_alias_candidates "$seed")
+  return 1
+}
+
+ensure_snapshot_aliases() {
+  local snapshot="$1" pane_id name refreshed status passes=0
+  while :; do
+    pane_id="$(printf '%s' "$snapshot" | jq -r '
+      .result.snapshot.agents[] | select((.name // "") == "") | .pane_id' | sed -n '1p')"
+    if [ -z "$pane_id" ]; then
+      while IFS="$FIELD_SEPARATOR" read -r pane_id name; do
+        [ -n "$pane_id" ] || continue
+        herdr_alias_in_pool "$name" && continue
+        break
+      done <<EOF
+$(printf '%s' "$snapshot" | jq -r '.result.snapshot.agents[] | [.pane_id,(.name // "")] | join("\u001f")')
+EOF
+      if [ -z "$pane_id" ] || herdr_alias_in_pool "$name"; then
+        printf '%s' "$snapshot"
+        return 0
+      fi
+    fi
+    if refreshed="$(rename_agent_from_snapshot "$snapshot" "$pane_id")"; then
+      snapshot="$refreshed"
+    else
+      status=$?
+      return "$status"
+    fi
+    passes=$((passes + 1))
+    [ "$passes" -le 4096 ] || return 1
+  done
+}
+
+presentation_generation_valid() {
+  [ "$(record_number "$(namespace_dir)/reconcile.state" pending_generation)" = "$1" ]
+}
+
+presentation_crash_after() {
+  [ "${HERDR_PANE_LABELS_TEST_CRASH_AFTER:-}" = "$1" ] || return 0
+  exit 97
+}
+
+trace_presentation_phase() {
+  [ -n "${HERDR_PANE_LABELS_TEST_TRACE_FILE:-}" ] || return 0
+  printf '%s\n' "$1" >> "$HERDR_PANE_LABELS_TEST_TRACE_FILE"
+}
+
+request_presentation() {
+  local reconcile lock owner pending completed location_metadata
+  local checkout_root repository_anchor retained_location generation now
+  initialize_namespace || return 1
+  reconcile="$(namespace_dir)/reconcile.state"
+  lock="$(namespace_dir)/presentation-inbox.lock"
+  acquire_claim "$lock" "$INBOX_LOCK_ATTEMPTS" || return 1
+  owner="$claim_owner_id"
+  pending="$(record_number "$reconcile" pending_generation)"
+  completed="$(record_number "$reconcile" completed_generation)"
+  location_metadata="$(record_number "$reconcile" location_metadata_high_water)"
+  checkout_root="$(read_state_field "$reconcile" checkout_root)"
+  repository_anchor="$(read_state_field "$reconcile" repository_anchor)"
+  retained_location="$(read_state_field "$reconcile" retained_location)"
+  now="$(now_seq)"
+  generation="$(max_number "$pending" "$completed" "$location_metadata" "$now")"
+  generation=$((generation + 1))
+  if ! write_reconcile_state "$reconcile" "$generation" "${completed:-0}" \
+    "${location_metadata:-0}" "$checkout_root" "$repository_anchor" "$retained_location"; then
+    release_claim "$lock" "$owner"
+    return 1
+  fi
+  release_claim "$lock" "$owner"
+}
+
+start_presentation_coordinator() {
+  [ -z "${HERDR_PANE_LABELS_TEST_NO_PRESENTATION:-}" ] || return 0
+  set -m
+  nohup bash "$SELF" --presentation-worker </dev/null >/dev/null 2>&1 &
+  set +m
+}
+
+complete_presentation_generation() {
+  local pass="$1" reconcile lock owner pending location_metadata
+  local checkout_root repository_anchor retained_location
+  reconcile="$(namespace_dir)/reconcile.state"
+  lock="$(namespace_dir)/presentation-inbox.lock"
+  acquire_claim "$lock" "$INBOX_LOCK_ATTEMPTS" || return 1
+  owner="$claim_owner_id"
+  pending="$(record_number "$reconcile" pending_generation)"
+  [ "$pending" = "$pass" ] || { release_claim "$lock" "$owner"; return 2; }
+  location_metadata="$(record_number "$reconcile" location_metadata_high_water)"
+  [ "$pass" -le "${location_metadata:-0}" ] || location_metadata="$pass"
+  checkout_root="$(read_state_field "$reconcile" checkout_root)"
+  repository_anchor="$(read_state_field "$reconcile" repository_anchor)"
+  retained_location="$(read_state_field "$reconcile" retained_location)"
+  if ! write_reconcile_state "$reconcile" "$pending" "$pass" "$location_metadata" \
+    "$checkout_root" "$repository_anchor" "$retained_location"; then
+    release_claim "$lock" "$owner"
+    return 1
+  fi
+  release_claim "$lock" "$owner"
+  presentation_crash_after pending-complete
+}
+
+pane_target_matches() {
+  local payload="$1" id="$2" terminal="$3" tab_id="$4" workspace="$5" runtime="$6" revision="$7" session_json="$8"
+  printf '%s' "$payload" | jq -e --arg id "$id" --arg terminal "$terminal" \
+    --arg tab "$tab_id" --arg workspace "$workspace" --arg runtime "$runtime" \
+    --argjson revision "$revision" --argjson session "$session_json" '
+      .result.pane
+      | .pane_id == $id and .terminal_id == $terminal and .tab_id == $tab and
+        .workspace_id == $workspace and (.agent // "") == $runtime and
+        .revision == $revision and (.agent_session // null) == $session
+    ' >/dev/null 2>&1
+}
+
+tab_target_matches() {
+  local payload="$1" id="$2" workspace="$3"
+  printf '%s' "$payload" | jq -e --arg id "$id" --arg workspace "$workspace" '
+    .result.tab | .tab_id == $id and .workspace_id == $workspace
+  ' >/dev/null 2>&1
+}
+
+compose_tab_intents() {
+  local snapshot="$1" presentations="$2" intents="" rows tab_id workspace current index parts named
+  local tab_count
+  local pane_id terminal pane_tab _pane_workspace runtime revision _session _current_pane intended
+  local outcome root anchor repo branch linked sha status git_ref worktree
+  tab_count="$(printf '%s' "$snapshot" | jq -r '.result.snapshot.tabs | length')" || return 1
+  rows="$(printf '%s' "$snapshot" | jq -r '
+    reduce .result.snapshot.tabs[] as $t ({counts: {}, out: []};
+      $t.workspace_id as $ws | .counts[$ws] = ((.counts[$ws] // 0) + 1)
+      | .out += [[$t.tab_id,$ws,$t.label,(.counts[$ws]|tostring)]])
+    | .out[] | join("\u001f")' | filter_records_of_width 4 "$tab_count")" || return 1
+  while IFS="$FIELD_SEPARATOR" read -r tab_id workspace current index; do
+    [ -n "$tab_id" ] || continue
+    parts=""; named=0
+    while IFS="$FIELD_SEPARATOR" read -r pane_id terminal pane_tab _pane_workspace runtime revision _session _current_pane intended outcome root anchor repo branch linked sha status git_ref worktree; do
+      [ "$pane_tab" = "$tab_id" ] || continue
+      [ "$intended" = "$IDLE_PANE_LABEL" ] || named=1
+      if [ -z "$parts" ]; then parts="$intended"; else parts="$parts$LABEL_SEPARATOR$intended"; fi
+    done <<EOF
+$presentations
+EOF
+    [ -n "$parts" ] || continue
+    [ "$named" -eq 1 ] || parts="$IDLE_PANE_LABEL $index"
+    intents="${intents}${intents:+
+}${tab_id}${FIELD_SEPARATOR}${workspace}${FIELD_SEPARATOR}${current}${FIELD_SEPARATOR}${parts}"
+  done <<EOF
+$rows
+EOF
+  printf '%s' "$intents"
+}
+
+reconcile_presentation_pass() {
+  local pass="$1" snapshot aliased alias_status final_snapshot initial_identity final_identity pool_json
+  local pane_rows baselines legacy_label_panes presentations="" tab_intents workspace_origins
+  local workspace_tokens space_rows space_roots root_statuses space_row status_row
+  local space_id space_current_branch space_current_status space_root space_branch
+  local status_outcome status_counts space_status
+  local id terminal tab_id workspace runtime revision session_json current alias pane_json_encoded pane_json
+  local current_repo current_worktree current_branch current_status current_git_ref current_space_origin
+  local location_file result outcome root anchor repo branch linked sha status intended
+  local location_pids="" location_results="" result_file pid probe_results="" child_failed=0
+  local roots root_tokens worktree git_ref ref place folder baseline
+  local pane_id state_file retained_pane presented_ids
+  local final_payload final_label final_tokens final_repo final_worktree final_branch final_status final_git_ref final_space_origin final_legacy
+  local space_origin
+  local location_changed location_seq
+  local pane_count active_tab_count
+  command -v jq >/dev/null 2>&1 || return 1
+  snapshot="$(read_complete_snapshot)" || return 1
+  trace_presentation_phase snapshot
+  if aliased="$(ensure_snapshot_aliases "$snapshot")"; then
+    snapshot="$aliased"
+  else
+    alias_status=$?
+    trace_presentation_phase "aliases-failed:$alias_status"
+    return "$alias_status"
+  fi
+  trace_presentation_phase aliases
+  # The color/animal pool is static for the process's lifetime, so a
+  # long-lived sweep daemon validates and encodes it once instead of on
+  # every pass; herdr_alias_candidates itself still validates per call on
+  # its public allocation path (rename_agent_from_snapshot), which callers
+  # may run with a test-overridden pool.
+  if [ -z "${_ALIAS_POOL_JSON_CACHE:-}" ]; then
+    _ALIAS_POOL_JSON_CACHE="$(herdr_alias_candidates validation | jq -Rsc 'split("\n")[:-1]')" || return 1
+  fi
+  pool_json="$_ALIAS_POOL_JSON_CACHE"
+  snapshot_aliases_in_pool "$snapshot" "$pool_json" || return 1
+  trace_presentation_phase alias-validation
+  initial_identity="$(printf '%s' "$snapshot" | snapshot_identity)" || return 1
+  pane_count="$(printf '%s' "$snapshot" | jq -r '.result.snapshot.panes | length')" || return 1
+  active_tab_count="$(printf '%s' "$snapshot" | jq -r '
+    .result.snapshot as $s
+    | [$s.tabs[] as $t
+       | select(any($s.panes[]; .tab_id == $t.tab_id and .workspace_id == $t.workspace_id))
+       | $t]
+    | length')" || return 1
+
+  pane_rows="$(printf '%s' "$snapshot" | jq -r '
+    .result.snapshot as $s | $s.panes[] as $p
+    | ([$s.agents[] | select(.pane_id == $p.pane_id)][0] // {}) as $a
+    | [$p.pane_id,$p.terminal_id,$p.tab_id,$p.workspace_id,($p.agent // ""),
+       ($p.revision|tostring),(($p.agent_session // null)|tojson),($p.label // ""),($a.name // ""),
+       ($p.tokens.repo // ""),($p.tokens.worktree // ""),($p.tokens.branch // ""),
+       ($p.tokens.location_status // ""),($p.tokens.git_ref // ""),
+       ($p.tokens.space_origin // ""),($p|@base64)]
+    | join("\u001f")' | filter_records_of_width 16 "$pane_count")" || return 1
+  baselines="$(printf '%s\n' "$pane_rows" | awk -F "$FIELD_SEPARATOR" -v OFS="$FIELD_SEPARATOR" 'NF {print $1,$10,$11,$12,$13,$14,$15}')"
+  # A worktree workspace names the space it was cut from. herdr already reports
+  # that parent as worktree.repo_name, so no Git probe is needed. A workspace
+  # whose own label already is the repository name (the main checkout) would
+  # only repeat itself, so it publishes nothing.
+  workspace_tokens="$(printf '%s' "$snapshot" | jq -r '
+    .result.snapshot.workspaces[]
+    | [.workspace_id, ((.tokens.branch) // ""), ((.tokens.git_status) // "")]
+    | join("\u001f")')" || return 1
+  workspace_origins="$(printf '%s' "$snapshot" | jq -r '
+    .result.snapshot.workspaces[]
+    | (.label // .name // "") as $label
+    | ((.worktree.repo_name) // "") as $origin
+    | [.workspace_id, (if $origin == "" or $origin == $label then "" else $origin end)]
+    | join("\u001f")')" || return 1
+  legacy_label_panes="$(printf '%s' "$snapshot" | jq -r '.result.snapshot.panes[] | select((.tokens.location_label // "") != "") | .pane_id')"
+  trace_presentation_phase rows
+
+  while IFS="$FIELD_SEPARATOR" read -r id terminal tab_id workspace runtime revision session_json current alias current_repo current_worktree current_branch current_status current_git_ref current_space_origin pane_json_encoded; do
+    [ -n "$id" ] || continue
+    pane_json="$(printf '%s' "$pane_json_encoded" | base64 -d 2>/dev/null)" || return 1
+    location_file="$(location_state_file "$id")"
+    result_file="$(umask 077; mktemp "$(namespace_dir)/.location-result.XXXXXX" 2>/dev/null)" || return 1
+    (
+      if [ -n "${HERDR_PANE_LABELS_TEST_LOCATION_BARRIER:-}" ] && [ -n "${HERDR_PANE_LABELS_TEST_LOCATION_BARRIER_COUNT:-}" ]; then
+        mkdir -p "$HERDR_PANE_LABELS_TEST_LOCATION_BARRIER" || exit 1
+        : > "$HERDR_PANE_LABELS_TEST_LOCATION_BARRIER/$(encode_key "$id")"
+        while :; do set -- "$HERDR_PANE_LABELS_TEST_LOCATION_BARRIER"/*; [ "$#" -ge "$HERDR_PANE_LABELS_TEST_LOCATION_BARRIER_COUNT" ] && break; sleep 0.001; done
+        if [ -n "${HERDR_PANE_LABELS_TEST_LOCATION_BARRIER_RELEASE:-}" ]; then
+          while [ ! -e "$HERDR_PANE_LABELS_TEST_LOCATION_BARRIER_RELEASE" ]; do sleep 0.001; done
+        fi
+      fi
+      resolve_pane_location "$pane_json" "$location_file" > "$result_file"
+    ) &
+    location_pids="${location_pids}${location_pids:+
+}$!"
+    location_results="${location_results}${location_results:+
+}$result_file"
+  done <<EOF
+$pane_rows
+EOF
+  while IFS= read -r pid; do [ -z "$pid" ] || wait "$pid" || child_failed=1; done <<EOF
+$location_pids
+EOF
+  while IFS= read -r result_file; do
+    [ -n "$result_file" ] || continue
+    result="$(filter_records_of_width 7 1 < "$result_file")"
+    status=$?
+    rm -f "$result_file"
+    [ "$status" -eq 0 ] || { child_failed=1; continue; }
+    [ -n "$result" ] || { child_failed=1; continue; }
+    probe_results="${probe_results}${probe_results:+
+}$result"
+  done <<EOF
+$location_results
+EOF
+  [ "$child_failed" -eq 0 ] || return 1
+  trace_presentation_phase locations
+
+  while IFS="$FIELD_SEPARATOR" read -r id terminal tab_id workspace runtime revision session_json current alias current_repo current_worktree current_branch current_status current_git_ref current_space_origin pane_json_encoded; do
+    [ -n "$id" ] || continue
+    result="${probe_results%%$'\n'*}"; [ -n "$result" ] || return 1
+    if [ "$probe_results" = "$result" ]; then probe_results=""; else probe_results="${probe_results#*$'\n'}"; fi
+    IFS="$FIELD_SEPARATOR" read -r outcome root anchor repo branch linked sha <<EOF
+$result
+EOF
+    status=""
+    case "$outcome" in
+      git) ;;
+      # root survives: it is the directory this pane sits in, and outside a
+      # checkout it is the whole of what the location row can say.
+      non_git) anchor=""; repo=""; branch=""; linked=""; sha="" ;;
+      transient)
+        if [ -n "$root" ]; then status=stale
+        elif [ -n "$current_repo" ] && [ -n "$current_worktree" ]; then
+          repo="$current_repo"; branch="$current_branch"; linked=""; sha=""; status=stale
+        fi ;;
+      *) return 1 ;;
+    esac
+    if [ -n "$runtime" ]; then
+      [ -n "$alias" ] && herdr_alias_in_pool "$alias" || return 1
+      intended="$(pane_label "$runtime" "$alias")"
+    else
+      intended="$(pane_process_label "$id")"; [ -n "$intended" ] || intended="$IDLE_PANE_LABEL"
+    fi
+    presentations="${presentations}${presentations:+
+}${id}${FIELD_SEPARATOR}${terminal}${FIELD_SEPARATOR}${tab_id}${FIELD_SEPARATOR}${workspace}${FIELD_SEPARATOR}${runtime}${FIELD_SEPARATOR}${revision}${FIELD_SEPARATOR}${session_json}${FIELD_SEPARATOR}${current}${FIELD_SEPARATOR}${intended}${FIELD_SEPARATOR}${outcome}${FIELD_SEPARATOR}${root}${FIELD_SEPARATOR}${anchor}${FIELD_SEPARATOR}${repo}${FIELD_SEPARATOR}${branch}${FIELD_SEPARATOR}${linked}${FIELD_SEPARATOR}${sha}${FIELD_SEPARATOR}${status}"
+  done <<EOF
+$pane_rows
+EOF
+  presentations="$(printf '%s\n' "$presentations" | filter_records_of_width 17 "$pane_count")" || return 1
+
+  roots="$(printf '%s\n' "$presentations" | awk -F "$FIELD_SEPARATOR" '$11 != "" {print $11}' | LC_ALL=C sort -u)"
+  root_tokens="$(build_worktree_tokens "$roots")"
+  probe_results=""
+  while IFS="$FIELD_SEPARATOR" read -r id terminal tab_id workspace runtime revision session_json current intended outcome root anchor repo branch linked sha status; do
+    [ -n "$id" ] || continue
+    worktree=""
+    if [ -n "$root" ]; then worktree="$(table_value_for "$root" "$root_tokens")"
+    elif [ "$outcome" = transient ] && [ -n "$repo" ]; then
+      baseline="$(table_row_for "$id" "$baselines")"; IFS="$FIELD_SEPARATOR" read -r _ worktree _ <<EOF
+$baseline
+EOF
+    fi
+    ref="$branch"; place=branch
+    if [ -z "$ref" ] && [ -n "$sha" ]; then ref="$sha"; place=commit
+    elif [ "$linked" = 1 ]; then place=worktree; fi
+    # Inside a checkout the ref answers the only question the row is asked:
+    # which branch, worktree, or commit this pane works on. Which directory
+    # that checkout happens to occupy is not something the user acts on, and
+    # for a generated worktree the directory name carries no meaning at all.
+    # The folder is therefore a fallback for panes with no ref, never a
+    # qualifier beside one.
+    folder=""
+    [ -n "$ref" ] || folder="$worktree"
+    git_ref="$(git_ref_for "$place" "$ref" "$folder" "$status")"
+    probe_results="${probe_results}${probe_results:+
+}${id}${FIELD_SEPARATOR}${terminal}${FIELD_SEPARATOR}${tab_id}${FIELD_SEPARATOR}${workspace}${FIELD_SEPARATOR}${runtime}${FIELD_SEPARATOR}${revision}${FIELD_SEPARATOR}${session_json}${FIELD_SEPARATOR}${current}${FIELD_SEPARATOR}${intended}${FIELD_SEPARATOR}${outcome}${FIELD_SEPARATOR}${root}${FIELD_SEPARATOR}${anchor}${FIELD_SEPARATOR}${repo}${FIELD_SEPARATOR}${branch}${FIELD_SEPARATOR}${linked}${FIELD_SEPARATOR}${sha}${FIELD_SEPARATOR}${status}${FIELD_SEPARATOR}${git_ref}${FIELD_SEPARATOR}${worktree}"
+  done <<EOF
+$presentations
+EOF
+  presentations="$(printf '%s\n' "$probe_results" | filter_records_of_width 19 "$pane_count")" || return 1
+  tab_intents="$(compose_tab_intents "$snapshot" "$presentations" | filter_records_of_width 4 "$active_tab_count")" || return 1
+  trace_presentation_phase intents
+
+  presentation_generation_valid "$pass" || return 2
+  final_snapshot="$(read_complete_snapshot)" || return 1
+  trace_presentation_phase final-snapshot
+  final_identity="$(printf '%s' "$final_snapshot" | snapshot_identity)" || return 1
+  [ "$final_identity" = "$initial_identity" ] || return 1
+  snapshot_aliases_in_pool "$final_snapshot" "$pool_json" || return 1
+
+  presented_ids="$(printf '%s\n' "$presentations" | cut -d "$FIELD_SEPARATOR" -f1)"
+  for state_file in "$(namespace_dir)"/panes/*/location.state; do
+    [ -f "$state_file" ] || continue
+    retained_pane="$(read_state_field "$state_file" pane)"
+    [ -z "$retained_pane" ] || list_contains_line "$retained_pane" "$presented_ids" || rm -f "$state_file" 2>/dev/null || return 1
+  done
+  while IFS="$FIELD_SEPARATOR" read -r id terminal tab_id workspace runtime revision session_json current intended outcome root anchor repo branch linked sha status git_ref worktree; do
+    [ -n "$id" ] || continue
+    location_file="$(location_state_file "$id")"
+    case "$outcome" in
+      git) location_state_matches "$location_file" "$id" "$terminal" "$root" "$anchor" "$repo" "$branch" "$linked" "$sha" ||
+        write_location_state "$location_file" "$id" "$terminal" "$root" "$anchor" "$repo" "$branch" "$linked" "$sha" || return 1 ;;
+      non_git) rm -f "$location_file" 2>/dev/null || return 1 ;;
+    esac
+  done <<EOF
+$presentations
+EOF
+
+  while IFS="$FIELD_SEPARATOR" read -r id terminal tab_id workspace runtime revision session_json current intended outcome root anchor repo branch linked sha status git_ref worktree; do
+    [ -n "$id" ] || continue
+    baseline="$(table_row_for "$id" "$baselines")"
+    IFS="$FIELD_SEPARATOR" read -r current_repo current_worktree current_branch current_status current_git_ref current_space_origin <<EOF
+$baseline
+EOF
+    # The origin is a property of the pane's workspace, not of its Git probe,
+    # so it is looked up here rather than carried through the location record.
+    # herdr renders its own separator between row tokens, so the value is the
+    # bare name.
+    space_origin="$(table_value_for "$workspace" "$workspace_origins")"
+    location_changed=0
+    [ "$current_space_origin" = "$space_origin" ] || location_changed=1
+    if { [ -n "$repo" ] && [ -n "$worktree" ]; } || [ "$outcome" = non_git ]; then
+      ! list_contains_line "$id" "$legacy_label_panes" || location_changed=1
+    fi
+    if [ -n "$repo" ] && [ -n "$worktree" ]; then
+      [ "$current_repo" = "$repo" ] && [ "$current_worktree" = "$worktree" ] &&
+        [ "$current_branch" = "$branch" ] && [ "$current_status" = "$status" ] &&
+        [ "$current_git_ref" = "$git_ref" ] || location_changed=1
+    elif [ "$outcome" = non_git ]; then
+      # Outside a checkout only git_ref is published; every other token must be
+      # absent, and a leftover from a previous Git location is a change.
+      [ -z "$current_repo$current_worktree$current_branch$current_status" ] &&
+        [ "$current_git_ref" = "$git_ref" ] || location_changed=1
+    fi
+    # A pane whose location hasn't changed and whose label is already correct
+    # needs no live pane fetch at all; skip the fork+parse for that steady-
+    # state no-op case.
+    if [ "$location_changed" -eq 1 ] || [ "$current" != "$intended" ]; then
+      final_payload="$(herdr pane get "$id" 2>/dev/null)" || {
+        [ "$STRICT_SWEEP" != 1 ] || return 1
+        continue
+      }
+      pane_target_matches "$final_payload" "$id" "$terminal" "$tab_id" "$workspace" "$runtime" "$revision" "$session_json" || {
+        [ "$STRICT_SWEEP" != 1 ] || return 1
+        continue
+      }
+      if [ "$location_changed" -eq 1 ]; then
+        final_tokens="$(printf '%s' "$final_payload" | jq -r '.result.pane.tokens | [(.repo//""),(.worktree//""),(.branch//""),(.location_status//""),(.git_ref//""),(.space_origin//""),(.location_label//"")] | join("\u001f")')"
+        IFS="$FIELD_SEPARATOR" read -r final_repo final_worktree final_branch final_status final_git_ref final_space_origin final_legacy <<EOF
+$final_tokens
+EOF
+        if [ "$final_repo" != "$repo" ] || [ "$final_worktree" != "$worktree" ] || [ "$final_branch" != "$branch" ] ||
+          [ "$final_status" != "$status" ] || [ "$final_git_ref" != "$git_ref" ] ||
+          [ "$final_space_origin" != "$space_origin" ] || [ -n "$final_legacy" ]; then
+          presentation_generation_valid "$pass" || return 2
+          location_seq="$pass"
+          set -- herdr pane report-metadata "$id" --source "$LOCATION_SOURCE_ID" --seq "$location_seq"
+          if [ -n "$space_origin" ]; then set -- "$@" --token "space_origin=$space_origin"; else set -- "$@" --clear-token space_origin; fi
+          if [ -n "$repo" ] && [ -n "$worktree" ]; then
+            set -- "$@" --token "repo=$repo" --token "worktree=$worktree" --token "git_ref=$git_ref" --clear-token pane_inline --clear-token location_label
+            if [ -n "$branch" ]; then set -- "$@" --token "branch=$branch"; else set -- "$@" --clear-token branch; fi
+            if [ -n "$status" ]; then set -- "$@" --token "location_status=$status"; else set -- "$@" --clear-token location_status; fi
+          elif [ "$outcome" = non_git ] && [ -n "$git_ref" ]; then
+            # A directory outside any checkout: the folder name is the row, and
+            # the Git tokens stay cleared so no integration reads a repository
+            # relationship that does not exist.
+            set -- "$@" --token "git_ref=$git_ref" --clear-token pane_inline --clear-token repo --clear-token worktree --clear-token branch --clear-token location_status --clear-token location_label
+          else
+            set -- "$@" --clear-token pane_inline --clear-token repo --clear-token worktree --clear-token branch --clear-token location_status --clear-token git_ref --clear-token location_label
+          fi
+          "$@" >/dev/null 2>&1 || {
+            [ "$STRICT_SWEEP" != 1 ] || return 1
+            continue
+          }
+          presentation_crash_after metadata
+        fi
+      fi
+      if [ "$current" != "$intended" ]; then
+        final_label="$(printf '%s' "$final_payload" | jq -r '.result.pane.label // ""')"
+        if [ "$final_label" != "$intended" ]; then
+          presentation_generation_valid "$pass" || return 2
+          herdr pane rename "$id" "$intended" >/dev/null 2>&1 || {
+            [ "$STRICT_SWEEP" != 1 ] || return 1
+            continue
+          }
+          presentation_crash_after pane-rename
+        fi
+      fi
+    fi
+  done <<EOF
+$presentations
+EOF
+
+  # Space rows read workspace metadata. herdr fills its builtin `branch` token
+  # only for a repository's primary checkout — a space on a linked worktree
+  # renders that row empty (herdrdev/herdr#2952, open against 0.8.0 and still
+  # reproducing on 0.8.2), and no builtin can be forced from outside. This pass
+  # already resolved every pane's checkout, so it reports the branch and the
+  # counts for each space itself, and the rows read `$branch` / `$git_status`.
+  space_rows="$(printf '%s\n' "$presentations" | LC_ALL=C sort -t "$FIELD_SEPARATOR" -k1,1 |
+    awk -F "$FIELD_SEPARATOR" -v OFS="$FIELD_SEPARATOR" '
+      NF >= 19 && $10 == "git" && $11 != "" && !($4 in seen) {
+        seen[$4] = 1
+        print $4, $11, ($14 != "" ? $14 : $16)
+      }')"
+  space_roots="$(printf '%s\n' "$space_rows" | awk -F "$FIELD_SEPARATOR" 'NF { print $2 }' | LC_ALL=C sort -u)"
+  root_statuses=""
+  if [ -n "$space_roots" ]; then
+    root_statuses="$(build_root_statuses "$space_roots")" || return 1
+  fi
+  while IFS="$FIELD_SEPARATOR" read -r space_id space_current_branch space_current_status; do
+    [ -n "$space_id" ] || continue
+    space_row="$(table_row_for "$space_id" "$space_rows")"
+    IFS="$FIELD_SEPARATOR" read -r space_root space_branch <<EOF
+$space_row
+EOF
+    if [ -n "$space_root" ]; then
+      status_row="$(table_row_for "$space_root" "$root_statuses")"
+      IFS="$FIELD_SEPARATOR" read -r status_outcome status_counts <<EOF
+$status_row
+EOF
+      case "$status_outcome" in
+        fresh) space_status="$(status_line_for "$status_counts")" ;;
+        # A probe that ran out of budget must not erase a count the user is
+        # looking at; it keeps what is published until the next pass answers.
+        *) space_status="$space_current_status" ;;
+      esac
+    else
+      space_branch=""
+      space_status=""
+    fi
+    [ "$space_current_branch" != "$space_branch" ] || [ "$space_current_status" != "$space_status" ] ||
+      continue
+    presentation_generation_valid "$pass" || return 2
+    set -- herdr workspace report-metadata "$space_id" --source "$LOCATION_SOURCE_ID" --seq "$pass"
+    if [ -n "$space_branch" ]; then set -- "$@" --token "branch=$space_branch"; else set -- "$@" --clear-token branch; fi
+    if [ -n "$space_status" ]; then set -- "$@" --token "git_status=$space_status"; else set -- "$@" --clear-token git_status; fi
+    "$@" >/dev/null 2>&1 || {
+      [ "$STRICT_SWEEP" != 1 ] || return 1
+      continue
+    }
+  done <<EOF
+$workspace_tokens
+EOF
+
+  while IFS="$FIELD_SEPARATOR" read -r tab_id workspace current intended; do
+    [ -n "$tab_id" ] || continue
+    [ "$current" != "$intended" ] || continue
+    presentation_generation_valid "$pass" || return 2
+    final_payload="$(herdr tab get "$tab_id" 2>/dev/null)" || {
+      [ "$STRICT_SWEEP" != 1 ] || return 1
+      continue
+    }
+    tab_target_matches "$final_payload" "$tab_id" "$workspace" || {
+      [ "$STRICT_SWEEP" != 1 ] || return 1
+      continue
+    }
+    final_label="$(printf '%s' "$final_payload" | jq -r '.result.tab.label')"
+    [ "$final_label" != "$intended" ] || continue
+    herdr tab rename "$tab_id" "$intended" >/dev/null 2>&1 || {
+      [ "$STRICT_SWEEP" != 1 ] || return 1
+      continue
+    }
+  done <<EOF
+$tab_intents
+EOF
+
+  if [ "$STRICT_SWEEP" = 1 ]; then
+    final_snapshot="$(read_complete_snapshot)" || {
+      printf 'herdr-pane-labels: strict sweep could not read the verification snapshot\n' >&2
+      return 1
+    }
+    final_identity="$(printf '%s' "$final_snapshot" | snapshot_identity)" || return 1
+    [ "$final_identity" = "$initial_identity" ] || {
+      printf 'herdr-pane-labels: strict sweep identity changed before verification\n' >&2
+      return 1
+    }
+    while IFS="$FIELD_SEPARATOR" read -r id terminal tab_id workspace runtime revision session_json current intended outcome root anchor repo branch linked sha status git_ref worktree; do
+      [ -n "$id" ] || continue
+      space_origin="$(table_value_for "$workspace" "$workspace_origins")"
+      printf '%s' "$final_snapshot" | jq -e \
+        --arg id "$id" --arg terminal "$terminal" --arg intended "$intended" \
+        --arg outcome "$outcome" --arg repo "$repo" --arg worktree "$worktree" \
+        --arg branch "$branch" --arg status "$status" --arg git_ref "$git_ref" \
+        --arg space_origin "$space_origin" '
+          [.result.snapshot.panes[] | select(.pane_id == $id and .terminal_id == $terminal)] as $panes
+          | ($panes | length) == 1 and ($panes[0].label == $intended)
+            and (($panes[0].tokens.space_origin // "") == $space_origin)
+            and (if ($repo != "" and $worktree != "") then
+              (($panes[0].tokens.repo // "") == $repo) and
+              (($panes[0].tokens.worktree // "") == $worktree) and
+              (($panes[0].tokens.branch // "") == $branch) and
+              (($panes[0].tokens.location_status // "") == $status) and
+              (($panes[0].tokens.git_ref // "") == $git_ref) and
+              (($panes[0].tokens.location_label // "") == "")
+            elif $outcome == "non_git" then
+              (["repo","worktree","branch","location_status","location_label"]
+                | all(.[]; . as $key | (($panes[0].tokens[$key] // "") == "")))
+              and (($panes[0].tokens.git_ref // "") == $git_ref)
+            else true end)
+        ' >/dev/null 2>&1 || {
+          printf 'herdr-pane-labels: strict sweep did not converge pane %s\n' "$id" >&2
+          return 1
+        }
+    done <<EOF
+$presentations
+EOF
+    while IFS="$FIELD_SEPARATOR" read -r tab_id workspace current intended; do
+      [ -n "$tab_id" ] || continue
+      printf '%s' "$final_snapshot" | jq -e --arg id "$tab_id" --arg workspace "$workspace" --arg intended "$intended" '
+        [.result.snapshot.tabs[] | select(.tab_id == $id and .workspace_id == $workspace and .label == $intended)]
+        | length == 1' >/dev/null 2>&1 || {
+          printf 'herdr-pane-labels: strict sweep did not converge tab %s\n' "$tab_id" >&2
+          return 1
+        }
+    done <<EOF
+$tab_intents
+EOF
+  fi
+}
+
+run_presentation_coordinator() {
+  local claim owner reconcile pending completed pass status pause
+  initialize_namespace || return 1
+  claim="$(namespace_dir)/presentation.claim"
+  reconcile="$(namespace_dir)/reconcile.state"
+  while :; do
+    acquire_claim "$claim" "$INBOX_LOCK_ATTEMPTS" || {
+      [ "$STRICT_SWEEP" != 1 ] || return 1
+      return 0
+    }
+    owner="$claim_owner_id"
+    status=0
+    while :; do
+      pending="$(record_number "$reconcile" pending_generation)"
+      completed="$(record_number "$reconcile" completed_generation)"
+      [ -n "$pending" ] || pending=0
+      [ -n "$completed" ] || completed=0
+      [ "$pending" -gt "$completed" ] || break
+      pass="$pending"
+      if reconcile_presentation_pass "$pass"; then
+        if complete_presentation_generation "$pass"; then
+          status=0
+        else
+          status=$?
+          [ "$status" -eq 2 ] && continue
+          break
+        fi
+      else
+        status=$?
+        if [ "$status" -eq 2 ]; then
+          trace_presentation_phase retry-stale-generation
+          continue
+        fi
+        break
+      fi
+    done
+    if [ "$status" -eq 0 ] && [ -n "${HERDR_PANE_LABELS_TEST_PAUSE_BEFORE_RELEASE:-}" ]; then
+      pause="$HERDR_PANE_LABELS_TEST_PAUSE_BEFORE_RELEASE"
+      : > "$pause.reached"
+      for _ in $(seq 1 1000); do [ -f "$pause.release" ] && break; sleep 0.01; done
+    fi
+    release_claim "$claim" "$owner"
+    pending="$(record_number "$reconcile" pending_generation)"
+    completed="$(record_number "$reconcile" completed_generation)"
+    if [ "$status" -ne 0 ]; then
+      # Do not spin on one failed generation. A newer invalidation that arrived
+      # during the failed pass still gets one fresh claim and snapshot.
+      [ "${pending:-0}" -gt "${pass:-0}" ] && continue
+      return "$status"
+    fi
+    [ "${pending:-0}" -gt "${completed:-0}" ] || return 0
+    # Reacquire after owner-only release. A producer racing the release either
+    # starts its own coordinator or leaves a generation this loop observes.
+  done
+}
+
+sweep_tabs() {
+  request_presentation || return 1
+  run_presentation_coordinator
+}
+
+# The sweep runs on a clock of its own rather than on herdr events, because the
+# change that matters most has no event: a command started or ended inside a
+# pane that already exists. The lock directory is created atomically, so a
+# second daemon exits instead of doubling the rename traffic.
+run_sweep_daemon() {
+  mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
+  # A daemon started right after its predecessor was killed finds the lock still
+  # there for a moment. Waiting a few seconds beats exiting, which would leave
+  # the machine with no daemon at all until the next herdr event.
+  local tries=0 start marker_attempt=0
+  until mkdir "$SWEEP_LOCK_DIR" 2>/dev/null; do
+    tries=$((tries + 1))
+    [ "$tries" -ge 3 ] && exit 0
+    sleep 1
+  done
+  printf '%s' "$$" > "$SWEEP_LOCK_DIR/pid" 2>/dev/null
+  until start="$(process_start_marker "$$")"; do
+    marker_attempt=$((marker_attempt + 1))
+    if [ "$marker_attempt" -ge 3 ]; then
+      rm -f "$SWEEP_LOCK_DIR/pid" 2>/dev/null
+      rmdir "$SWEEP_LOCK_DIR" 2>/dev/null
+      exit 0
+    fi
+    sleep 0.01
+  done
+  printf '%s\n' "$start" > "$SWEEP_LOCK_DIR/start" 2>/dev/null
+  # Two traps, not one: a TERM handler that only cleans up would let the loop
+  # carry on after it dropped its own lock, and the next hook would then start
+  # a second daemon beside the first.
+  #
+  # The cleanup releases the lock only while this daemon still owns it. A
+  # dying daemon that cleared its successor's lock left no daemon running.
+  trap 'if [ "$(cat "$SWEEP_LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; then
+          rm -f "$SWEEP_LOCK_DIR/pid" "$SWEEP_LOCK_DIR/start"
+          rmdir "$SWEEP_LOCK_DIR" 2>/dev/null
+        fi' EXIT
+  trap 'exit 0' INT TERM
+  local misses=0
+  while :; do
+    # Whoever holds the pid file owns the sweep. Losing it means another daemon
+    # took over, and two daemons would rename every tab twice per interval.
+    [ "$(cat "$SWEEP_LOCK_DIR/pid" 2>/dev/null)" = "$$" ] || exit 0
+    if sweep_tabs; then
+      misses=0
+    else
+      # herdr stopped answering: the server is gone, and with it the reason to
+      # keep sweeping. Three misses rather than one, to ride out a restart.
+      misses=$((misses + 1))
+      [ "$misses" -ge 3 ] && exit 0
+    fi
+    sleep "$SWEEP_INTERVAL"
+  done
+}
+
+# Called by the herdr plugin on startup and on agent-status events. A live
+# daemon makes this a no-op; a lock left behind by a killed daemon is cleared.
+ensure_sweep_daemon() {
+  local self="$1" pid start identity_status startup_attempt=0
+  [ -z "${HERDR_PANE_LABELS_TEST_NO_DAEMON:-}" ] || return 0
+  if [ -d "$SWEEP_LOCK_DIR" ]; then
+    while [ "$startup_attempt" -lt 100 ]; do
+      pid="$(cat "$SWEEP_LOCK_DIR/pid" 2>/dev/null)"
+      case "$pid" in
+        '') ;;
+        *[!0-9]*) break ;;
+        *)
+          kill -0 "$pid" 2>/dev/null || break
+          [ ! -s "$SWEEP_LOCK_DIR/start" ] || break
+          ;;
+      esac
+      startup_attempt=$((startup_attempt + 1))
+      sleep 0.01
+    done
+    pid="$(cat "$SWEEP_LOCK_DIR/pid" 2>/dev/null)"
+    start="$(cat "$SWEEP_LOCK_DIR/start" 2>/dev/null)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      process_start_matches "$pid" "$start"
+      identity_status=$?
+      [ "$identity_status" -eq 1 ] || return 0
+    fi
+    rm -f "$SWEEP_LOCK_DIR/pid" "$SWEEP_LOCK_DIR/start" 2>/dev/null
+    rmdir "$SWEEP_LOCK_DIR" 2>/dev/null
+  fi
+  # herdr reaps the process group of a plugin hook once the hook exits, and a
+  # plain background child shares that group — it was killed within the second.
+  # Job control puts the daemon in a process group of its own, out of reach.
+  set -m
+  nohup bash "$self" --sweep-daemon </dev/null >/dev/null 2>&1 &
+  set +m
+  return 0
+}
+
+stop_sweep_daemon() {
+  local pid start current_start command attempts=0
+  [ -n "$SOCKET_PATH" ] || return 0
+  [ -d "$SWEEP_LOCK_DIR" ] || return 0
+  pid="$(cat "$SWEEP_LOCK_DIR/pid" 2>/dev/null)"
+  start="$(cat "$SWEEP_LOCK_DIR/start" 2>/dev/null)"
+  case "$pid" in '' | *[!0-9]*) return 0 ;; esac
+  kill -0 "$pid" 2>/dev/null || return 0
+  current_start="$(process_start_marker "$pid")" || return 1
+  [ "$current_start" = "$start" ] || return 1
+  command="$(ps -ww -p "$pid" -o command= 2>/dev/null)"
+  case "$command" in
+    *"$SELF --sweep-daemon"*) ;;
+    *) return 1 ;;
+  esac
+  kill -TERM "$pid" 2>/dev/null || return 1
+  while kill -0 "$pid" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 100 ] || return 1
+    sleep 0.01
+  done
+}
+
+case "$mode" in
+  event | presentation-worker | sweep | sweep-daemon | ensure-sweep-daemon)
+    if [ -z "$SOCKET_PATH" ]; then
+      printf "%s\n" "herdr-pane-labels: presentation skipped without HERDR_SOCKET_PATH" >&2
+      exit 0
+    fi
+    initialize_namespace || {
+      [ "$mode" != sweep ] || exit 1
+      exit 0
+    }
+    SWEEP_LOCK_DIR="$(namespace_dir)/sweep.lock"
+    ;;
+esac
+
+case "$mode" in
+  stop)
+    if [ -z "$SOCKET_PATH" ]; then
+      printf "%s\n" "herdr-pane-labels: stop skipped without HERDR_SOCKET_PATH" >&2
+      exit 0
+    fi
+    initialize_namespace || exit 0
+    SWEEP_LOCK_DIR="$(namespace_dir)/sweep.lock"
+    stop_sweep_daemon
+    ;;
+  event)
+    if request_presentation; then start_presentation_coordinator || true; fi
+    ensure_sweep_daemon "$SELF" || true
+    ;;
+  presentation-worker)
+    close_inherited_descriptors
+    run_presentation_coordinator
+    ;;
+  sweep) sweep_tabs || exit 1 ;;
+  sweep-daemon)
+    close_inherited_descriptors
+    run_sweep_daemon
+    ;;
+  ensure-sweep-daemon) ensure_sweep_daemon "$SELF" ;;
+esac
+
+exit 0

@@ -1,0 +1,92 @@
+id = "seigi.pane-labels"
+name = "Pane Labels"
+version = "0.2.0"
+min_herdr_version = "0.8.2"
+description = "Keep pane and tab labels, aliases, and Git location metadata in step with each pane."
+platforms = ["macos", "linux"]
+
+[[build]]
+platforms = ["macos", "linux"]
+command = ["sh", "scripts/install-cli-shim.sh"]
+
+[[startup]]
+platforms = ["macos", "linux"]
+command = ["sh", "bin/ensure.sh"]
+
+[[events]]
+on = "pane.created"
+command = ["sh", "bin/ensure.sh", "--event"]
+
+[[events]]
+on = "pane.moved"
+command = ["sh", "bin/ensure.sh", "--event"]
+
+[[events]]
+on = "pane.exited"
+command = ["sh", "bin/ensure.sh", "--event"]
+
+[[events]]
+on = "pane.closed"
+command = ["sh", "bin/ensure.sh", "--event"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["sh", "bin/ensure.sh", "--event"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["sh", "bin/ensure.sh", "--event"]
+
+[[events]]
+on = "tab.created"
+command = ["sh", "bin/ensure.sh", "--event"]
+
+[[events]]
+on = "tab.closed"
+command = ["sh", "bin/ensure.sh", "--event"]
+
+[[events]]
+on = "tab.moved"
+command = ["sh", "bin/ensure.sh", "--event"]
+
+[[events]]
+on = "tab.renamed"
+command = ["sh", "bin/ensure.sh", "--event"]
+
+[[events]]
+on = "worktree.created"
+command = ["sh", "bin/ensure.sh", "--event"]
+
+[[events]]
+on = "worktree.opened"
+command = ["sh", "bin/ensure.sh", "--event"]
+
+[[actions]]
+id = "sweep"
+title = "Pane labels: refresh now"
+contexts = ["workspace"]
+command = ["sh", "bin/sweep.sh"]
+
+[[actions]]
+id = "start"
+title = "Pane labels: start reconciler"
+contexts = ["workspace"]
+command = ["sh", "bin/start.sh"]
+
+[[actions]]
+id = "stop"
+title = "Pane labels: stop reconciler"
+contexts = ["workspace"]
+command = ["sh", "bin/stop.sh"]
+
+[[actions]]
+id = "update"
+title = "Pane labels: update package"
+contexts = ["workspace"]
+command = ["sh", "bin/update.sh"]
+
+[[actions]]
+id = "diagnostics"
+title = "Pane labels: diagnostics"
+contexts = ["workspace"]
+command = ["sh", "bin/diagnostics.sh"]
