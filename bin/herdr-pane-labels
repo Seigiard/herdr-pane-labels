@@ -121,7 +121,7 @@ case "$mode" in
     exit
     ;;
   diagnostics)
-    printf 'version=0.2.0\n'
+    printf 'version=0.2.1\n'
     printf 'state_dir=%s\n' "$STATE_DIR"
     printf 'socket=%s\n' "${SOCKET_PATH:-unset}"
     printf 'engine=%s\n' "$SELF"

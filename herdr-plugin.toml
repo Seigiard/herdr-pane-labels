@@ -1,6 +1,6 @@
 id = "seigi.pane-labels"
 name = "Pane Labels"
-version = "0.2.0"
+version = "0.2.1"
 min_herdr_version = "0.8.2"
 description = "Keep pane and tab labels, aliases, and Git location metadata in step with each pane."
 platforms = ["macos", "linux"]

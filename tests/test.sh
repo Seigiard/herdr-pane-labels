@@ -27,7 +27,7 @@ test_alias_contract() {
 test_package_diagnostics() {
   local output
   output="$(HOME="$ROOT/tests/home" "$ENGINE" --diagnostics)"
-  [[ "$output" == *'version=0.2.0'* ]] || fail 'diagnostics reports package version'
+  [[ "$output" == *'version=0.2.1'* ]] || fail 'diagnostics reports package version'
   [[ "$output" == *"engine=$ENGINE"* ]] || fail 'diagnostics reports engine path'
   pass 'package diagnostics'
 }
