@@ -34,6 +34,7 @@ teardown() {
 
 function test_scripts_1103_herdr_pane_labels_descriptor_probe_closes_worker_pipes() {
   _bats_test_init 1103 'herdr-pane-labels descriptor probe closes detached worker pipes'
+  command -v python3 >/dev/null || skip "python3 not available"
   local probe_file="$BATS_TEST_DIRNAME/bashunit/herdr_pane_labels_descriptor_probe_test.sh"
   local release_file="$BATS_TEST_TMPDIR/release-herdr"
   local pid_file="$BATS_TEST_TMPDIR/descriptor-worker.pid"
@@ -195,7 +196,8 @@ function test_scripts_1106_herdr_pane_labels_harness_applies_source_metadata_seq
   hpl_socket_run "$HPL_DEFAULT_SOCKET" pane report-metadata --source location pane-1 --seq 2 --token repo=alpha
   hpl_socket_run "$HPL_DEFAULT_SOCKET" pane report-metadata --source foreign pane-1 --seq 1 --token foreign=review
   hpl_socket_run "$HPL_DEFAULT_SOCKET" pane report-metadata --source location pane-1 --seq 1 --clear-token repo
-  local state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
+  local state
+  state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
   assert_equal "$(jq -r '.metadata["pane-1"].location.tokens.repo' "$state")" alpha
   assert_equal "$(jq -r '.panes[0].tokens.foreign' "$state")" review
 
@@ -246,6 +248,7 @@ function test_scripts_1107_herdr_pane_labels_harness_models_target_loss_move_reu
 function test_scripts_1108_herdr_pane_labels_assigns_distinct_aliases_and_renders_() {
   _bats_test_init 1108 'herdr-pane-labels assigns distinct aliases and renders known and fallback runtime prefixes'
   command -v jq >/dev/null || skip "jq not available"
+  # shellcheck source=/dev/null
   source "$HERDR_ALIASES"
   hpl_setup
   export HERDR_ALIAS_TEST_SEED=u2-prefixes
@@ -361,6 +364,7 @@ function test_scripts_1112_herdr_pane_labels_sources_the_alias_library_relative_
 function test_scripts_1114_herdr_pane_labels_retries_only_an_exact_confirmed_agent() {
   _bats_test_init 1114 'herdr-pane-labels retries only an exact confirmed agent_name_taken conflict'
   command -v jq >/dev/null || skip "jq not available"
+  # shellcheck source=/dev/null
   source "$HERDR_ALIASES"
   hpl_setup
   export HERDR_ALIAS_TEST_SEED=u2-conflict
@@ -454,6 +458,7 @@ function test_scripts_1115_herdr_pane_labels_never_renames_a_stale_target_that_e
 function test_scripts_1116_herdr_pane_labels_accepts_a_same_pane_replacement_in_th() {
   _bats_test_init 1116 'herdr-pane-labels accepts a same-pane replacement in the rename command interval'
   command -v jq >/dev/null || skip "jq not available"
+  # shellcheck source=/dev/null
   source "$HERDR_ALIASES"
   hpl_setup
   export HERDR_ALIAS_TEST_SEED=u2-command-interval
@@ -603,7 +608,8 @@ function test_scripts_1122_herdr_pane_labels_presentation_retries_a_newer_invali
   hpl_set_pane "$HPL_DEFAULT_SOCKET" '{"pane_id":"pane-1","tab_id":"tab-1","workspace_id":"ws-1","terminal_id":"term-1","agent":null,"label":"old","tokens":{}}'
   hpl_set_tab "$HPL_DEFAULT_SOCKET" '{"tab_id":"tab-1","workspace_id":"ws-1","label":"old"}'
   hpl_proc_info pane-1 '{"result":{"process_info":{"shell_pid":100,"foreground_process_group_id":200,"foreground_processes":[{"pid":200,"name":"btop","argv0":"btop","argv":["btop"]}]}}}'
-  local dir="$(hpl_socket_dir "$HPL_DEFAULT_SOCKET")"
+  local dir
+  dir="$(hpl_socket_dir "$HPL_DEFAULT_SOCKET")"
   : > "$dir/fail-next-snapshot"
   : > "$HPL_WORK/block-herdr"
   hpl_event_run
@@ -881,7 +887,7 @@ function test_scripts_1132_herdr_pane_labels_location_resolves_main_linked_neste
   hpl_set_tab "$HPL_DEFAULT_SOCKET" '{"tab_id":"tab-1","workspace_id":"ws-1","label":""}'
   hpl_set_workspace "$HPL_DEFAULT_SOCKET" '{"workspace_id":"ws-1","label":"repository"}'
   for pane_id in main-nested main-admin linked-admin fallback foreground-wins agent-ignores-foreground; do hpl_set_process_label "$pane_id" "$pane_id"; done
-  LANG=fr_FR.UTF-8 LC_ALL= hpl_location_pass
+  LANG=fr_FR.UTF-8 LC_ALL='' hpl_location_pass
   state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
 
   assert_equal "$(jq -r '.panes[] | select(.pane_id == "main-nested" or .pane_id == "main-admin") | .tokens.repo' "$state" | sort -u)" repository
@@ -908,7 +914,10 @@ function test_scripts_1133_herdr_pane_labels_dangling_administrative_gitdir_reta
   command -v jq >/dev/null || skip "jq not available"
   hpl_setup
   local main="$HPL_WORK/checkouts/repository" linked="$HPL_WORK/linked/feature"
-  local common="$main/.git" admin="$common/worktrees/feature/logs" state
+  local common="$main/.git"
+  # Separate `local`: a variable assigned earlier in the same `local` has
+  # not taken effect yet, so admin would resolve against an empty $common.
+  local admin="$common/worktrees/feature/logs" state
   mkdir -p "$common/worktrees/feature/logs" "$linked"
   hpl_mark_linked_worktree "$linked" "$common/worktrees/feature"
   printf '%s/.git\n' "$linked" > "$common/worktrees/feature/gitdir"
@@ -1332,7 +1341,8 @@ function test_scripts_1143_herdr_pane_labels_location_authoritative_worktree_del
   local live="$root/live" missing="$root/gone"
   mkdir -p "$live" "$common"
   hpl_git_location_fixture "$live" "$root" "$common" refs/heads/deleted
-  hpl_git_fixture "gitdir:$common" "worktree $HPL_WORK/main\nHEAD 123456\nbranch refs/heads/main" 0
+  hpl_git_fixture "gitdir:$common" \
+    "$(printf 'worktree %s\nHEAD 123456\nbranch refs/heads/main' "$HPL_WORK/main")" 0
   hpl_set_pane "$HPL_DEFAULT_SOCKET" "$(hpl_process_pane_json pane-1 tab-1 "$live")"
   hpl_set_tab "$HPL_DEFAULT_SOCKET" '{"tab_id":"tab-1","workspace_id":"ws-1","label":""}'
   hpl_set_process_label pane-1 worker
@@ -1753,7 +1763,8 @@ function test_scripts_1157_herdr_pane_labels_worktree_token_ordinal_fallback_is_
   before="$(jq -c '[.panes | sort_by(.pane_id)[] | [.pane_id,.tokens.worktree]]' "$(hpl_socket_state "$HPL_DEFAULT_SOCKET")")"
   run jq -e '[.panes[].tokens.worktree] | length == 12 and (unique | length == 12) and all(.[]; length <= 18)' "$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
   assert_success
-  local state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")" tmp="$HPL_WORK/reversed.json"
+  local state tmp="$HPL_WORK/reversed.json"
+  state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
   jq '.panes |= reverse' "$state" > "$tmp" && mv "$tmp" "$state"
   hpl_location_pass
   after="$(jq -c '[.panes | sort_by(.pane_id)[] | [.pane_id,.tokens.worktree]]' "$state")"
@@ -2022,7 +2033,8 @@ function test_scripts_1166_herdr_pane_labels_sweep_repairs_process_and_cwd_chang
   run hpl_sweep_run --sweep
   assert_success
 
-  local state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
+  local state
+  state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
   assert_equal "$(jq -r '.panes[0].label' "$state")" "cargo test"
   assert_equal "$(jq -r '.panes[0].tokens.worktree' "$state")" new-worktree
   assert_file_contains "$HPL_LOG" '^api snapshot$'
@@ -2218,7 +2230,8 @@ function test_scripts_1176_herdr_pane_labels_ensure_sweep_daemon_keeps_a_single_
   command -v jq >/dev/null || skip "jq not available"
   hpl_setup
   sleep 30 &
-  local live=$! sweep_lock="$(hpl_namespace "$HPL_DEFAULT_SOCKET")/sweep.lock"
+  local live=$! sweep_lock
+  sweep_lock="$(hpl_namespace "$HPL_DEFAULT_SOCKET")/sweep.lock"
   mkdir -p "$sweep_lock"
   printf '%s' "$live" > "$sweep_lock/pid"
   ps -p "$live" -o lstart= | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' > "$sweep_lock/start"
@@ -2245,7 +2258,8 @@ function test_scripts_1177_herdr_pane_labels_ensure_sweep_daemon_replaces_a_dead
   hpl_tab_list '{"result":{"tabs":[{"tab_id":"tab-1","label":"1"}]}}'
   hpl_pane_list '{"result":{"panes":[
     {"pane_id":"pane-1","tab_id":"tab-1","agent":"claude","label":"agent-label"}]}}'
-  local sweep_lock="$(hpl_namespace "$HPL_DEFAULT_SOCKET")/sweep.lock"
+  local sweep_lock
+  sweep_lock="$(hpl_namespace "$HPL_DEFAULT_SOCKET")/sweep.lock"
   mkdir -p "$sweep_lock"
   # A pid that cannot be running: process ids are allocated from 1 upwards.
   printf '%s' "999999" > "$sweep_lock/pid"
@@ -2297,6 +2311,7 @@ SH
 function test_scripts_1179_herdr_pane_labels_names_an_agent_whose_fresh_pane_repor() {
   _bats_test_init 1179 'herdr-pane-labels names an agent whose fresh pane reports no label yet'
   command -v jq >/dev/null || skip "jq not available"
+  # shellcheck source=/dev/null
   source "$HERDR_ALIASES"
   hpl_setup
   hpl_set_agent_pane "$HPL_DEFAULT_SOCKET" pane-1 tab-1 ws-1 term-1 claude
@@ -2318,4 +2333,11 @@ function test_scripts_1179_herdr_pane_labels_names_an_agent_whose_fresh_pane_rep
 
 function tear_down() { _bats_run_teardown; }
 
-function tear_down_after_script() { _bats_file_cleanup; }
+# The stub assets are per-file, not per-test: bashunit runs every test body in
+# a subshell, so an export from hpl_setup_assets inside one test never reaches
+# the next. These hooks run in the file shell, which is the only place the
+# export survives -- without them each test rebuilds the stubs and leaks its
+# own $BATS_TMPDIR/hpl-assets.* directory.
+function set_up_before_script() { hpl_setup_assets; }
+
+function tear_down_after_script() { hpl_teardown_assets; _bats_file_cleanup; }
