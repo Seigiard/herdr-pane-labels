@@ -1,8 +1,8 @@
-# Herdr pane-labels Bats harness.
+# Herdr pane-labels bashunit harness.
 # Load this after the package test header so SOURCE_ROOT and bashunit assertions exist.
 
 HPL_ENGINE="$SOURCE_ROOT/bin/herdr-pane-labels"
-# shellcheck disable=SC2034 # The loading Bats file reads this shared harness value.
+# shellcheck disable=SC2034 # The loading test file reads this shared harness value.
 HPL_PLUGIN_DIR="$SOURCE_ROOT"
 
 # Codicon glyphs of the $git_ref grammar, pinned as literal octal UTF-8
@@ -15,8 +15,7 @@ HPL_PLUGIN_DIR="$SOURCE_ROOT"
 # deliberate rather than an oversight waiting to be tidied away.
 #
 # "Spell the octal table once" is the rule for the *generator* — the engine must
-# build each glyph from a single octal printf, see
-# docs/solutions/design-patterns/generate-pua-glyphs-from-octal-printf.md — and
+# build each glyph from a single octal printf — and
 # the exact inverse for an *oracle*, which discriminates only while it holds a
 # copy the thing under test cannot move. These glyphs are a user-facing
 # pane-label contract with no config or environment override, so a mismatch is a
@@ -24,8 +23,8 @@ HPL_PLUGIN_DIR="$SOURCE_ROOT"
 #
 # Raw PUA glyphs are lost when files pass through editors and agents, so neither
 # side may hold the character verbatim; both spell it as octal. Test 1208 in
-# scripts_test.sh asserts these constants stay invariant when the engine's table
-# is perturbed.
+# tests/bashunit/pane_labels_behavior_test.sh asserts these constants stay
+# invariant when the engine's table is perturbed.
 # shellcheck disable=SC2034
 HPL_ICON_BRANCH="$(printf '\356\261\257')"   # nf-cod-git_branch U+EC6F
 # shellcheck disable=SC2034
@@ -36,31 +35,14 @@ HPL_ICON_COMMIT="$(printf '\356\253\274')"   # nf-cod-git_commit U+EAFC
 HPL_ICON_FOLDER="$(printf '\356\252\203')"   # nf-cod-folder U+EA83
 # shellcheck disable=SC2034
 HPL_ICON_PULL="$(printf '\342\207\243')"     # U+21E3 downwards dashed arrow
+# shellcheck disable=SC2034
 HPL_ICON_PUSH="$(printf '\342\207\241')"     # U+21E1 upwards dashed arrow
+# shellcheck disable=SC2034
 HPL_ICON_STALE="$(printf '\356\252\202')"    # nf-cod-history U+EA82
 
 hpl_teardown() {
-  # Reap a background reader a failed test left running BEFORE deleting its
-  # HPL_WORK: the loop only stops via a file inside HPL_WORK, so once that
-  # directory is gone the orphan spins forever and its ENOENT stderr lands on
-  # top of the real failure output.
-  if [[ -n "${HPL_READER_PID:-}" ]]; then
-    kill "$HPL_READER_PID" 2>/dev/null || true
-    wait "$HPL_READER_PID" 2>/dev/null || true
-    unset HPL_READER_PID
-  fi
-  if [[ -n "${HPL_CUTOVER_HOME:-}" ]]; then
-    for pid_file in \
-      "$HPL_CUTOVER_HOME"/.cache/herdr-task-sync/sweep.lock/pid \
-      "$HPL_CUTOVER_HOME"/.cache/herdr-task-sync/sockets/*/sweep.lock/pid \
-      "$HPL_CUTOVER_HOME"/.cache/herdr-pane-labels/sockets/*/sweep.lock/pid; do
-      [[ -f "$pid_file" ]] || continue
-      kill "$(cat "$pid_file")" 2>/dev/null || true
-    done
-  fi
   [[ -n "${HPL_WORK:-}" ]] && rm -rf "$HPL_WORK" || true
   unset HPL_WORK HPL_STUB HPL_STATE HPL_LOG HPL_DEFAULT_SOCKET HPL_SOCKET_ROOT
-  unset HPL_CUTOVER_HOME HPL_CUTOVER_BEFORE HPL_CUTOVER_AFTER HPL_CUTOVER_TRACE
 }
 
 # The four stub scripts and the fixture library are invariant: they read
@@ -69,22 +51,41 @@ hpl_teardown() {
 # test's stub directory keeps every setup from rewriting them. The jq lookup is
 # hoisted for the same reason.
 hpl_setup_assets() {
-  [[ -z "${HPL_ASSETS:-}" ]] || hpl_teardown_assets
+  # Only the run that created an asset directory may replace or remove it, and
+  # the owner token is pid AND test file. Both halves are load-bearing:
+  #   - the pid excludes the nested runner invocation test 1103 drives, which
+  #     inherits HPL_ASSETS through the environment;
+  #   - the file name excludes a sibling file in the same process, because $$
+  #     is unchanged in the forked per-file worker bashunit uses under -j, so
+  #     the main shell still holds the previous file's HPL_ASSETS when the next
+  #     file's set_up_before_script runs.
+  # Without the file half, `bashunit -j 8 <behavior file> <other file>` deletes
+  # the first file's stubs while its worker is still symlinking them.
+  if [[ -n "${HPL_ASSETS:-}" && "${HPL_ASSETS_OWNER:-}" == "$$:${BATS_TEST_FILENAME:-}" ]]; then
+    hpl_teardown_assets
+  fi
   HPL_ASSETS="$(mktemp -d "${BATS_TMPDIR:-/tmp}/hpl-assets.XXXXXX")"
+  HPL_ASSETS_OWNER="$$:${BATS_TEST_FILENAME:-}"
   HPL_JQ_BIN="$(command -v jq 2>/dev/null || true)"
-  export HPL_ASSETS HPL_JQ_BIN
+  export HPL_ASSETS HPL_ASSETS_OWNER HPL_JQ_BIN
 
   # The mutable fixture uses exact socket paths as identities. Numeric storage
   # directories avoid the collision caused by replacing punctuation in names.
   cat > "$HPL_ASSETS/fixture-lib.sh" <<'SH'
 # The stub emulates the `herdr api snapshot` envelope of herdr 0.8.2, which
-# reports protocol 20. Both numbers come from the installed binary rather than
-# from an assumption: `herdr --version`, and
+# reports protocol 20. Both numbers were read off the installed binary rather
+# than assumed: `herdr --version`, and
 # `herdr api snapshot | jq .result.snapshot.protocol`. The engine never reads
 # .protocol, so this literal records what the fake claims to be rather than
-# behaviour under test. Test 1209 in scripts_test.sh is what keeps the record
-# honest -- it compares this stub's top-level result keys against the real
-# binary's, and skips where herdr is absent.
+# behaviour under test.
+#
+# NOTHING in this package checks that claim. The envelope-fidelity test lives
+# upstream in the dotfiles suite (herdr_resource_tree_test.sh), was not part of
+# this extraction, and is written against a different fixture shape, so it did
+# not come along. Treat the two numbers above as a dated note, not a verified
+# correspondence -- upstream fixtures already track 0.9.0 / protocol 22. Adding
+# a check here means comparing this stub's top-level result keys against the
+# real binary's and skipping where herdr is absent.
 hpl_fixture_init_dir() {
   mkdir -p "$1/calls" "$1/completions" "$1/locks" "$1/after"
   [ -f "$1/state.json" ] || printf '%s\n' \
@@ -402,9 +403,6 @@ if [ -d "$fixture" ]; then
   : > "$fixture/started"
   mkdir -p "$HPL_WORK/git-started"
   : > "$HPL_WORK/git-started/${fixture##*/}"
-  if [ -n "${HPL_GIT_PROBE_ID:-}" ]; then
-    : > "$HPL_WORK/git-started/$HPL_GIT_PROBE_ID"
-  fi
   if [ -f "$fixture/block" ]; then
     while [ ! -f "$fixture/release" ]; do sleep 0.01; done
   fi
@@ -430,35 +428,17 @@ fi
 exit 1
 SH
 
+  chmod +x "$HPL_ASSETS/herdr" "$HPL_ASSETS/git"
 
-  cat > "$HPL_ASSETS/hpl-crash-worker" <<'SH'
-#!/usr/bin/env bash
-set -e
-state="$1"
-crash_after="${2:-none}"
-markers="$state.markers"
-mkdir -p "$markers"
-[ -f "$state" ] || printf '%s\n' '{"completed":[],"complete":false}' > "$state"
-for boundary in enqueue state presentation; do
-  if jq -e --arg boundary "$boundary" '.completed | index($boundary)' "$state" >/dev/null; then
-    continue
-  fi
-  tmp="$state.tmp.$$"
-  jq --arg boundary "$boundary" '.completed += [$boundary]' "$state" > "$tmp"
-  mv "$tmp" "$state"
-  : > "$markers/$boundary"
-  [ "$crash_after" != "$boundary" ] || exit 97
-done
-tmp="$state.tmp.$$"
-jq '.complete = true' "$state" > "$tmp"
-mv "$tmp" "$state"
-SH
-  chmod +x "$HPL_ASSETS/herdr" "$HPL_ASSETS/git" "$HPL_ASSETS/hpl-crash-worker"
 }
 
 hpl_teardown_assets() {
-  [[ -n "${HPL_ASSETS:-}" ]] && rm -rf "$HPL_ASSETS" || true
-  unset HPL_ASSETS HPL_JQ_BIN
+  # Same ownership rule as hpl_setup_assets: neither a nested run nor a sibling
+  # test file may delete a directory it merely inherited.
+  if [[ -n "${HPL_ASSETS:-}" && "${HPL_ASSETS_OWNER:-}" == "$$:${BATS_TEST_FILENAME:-}" ]]; then
+    rm -rf "$HPL_ASSETS"
+  fi
+  unset HPL_ASSETS HPL_ASSETS_OWNER HPL_JQ_BIN
 }
 
 # Build a sandbox with a stub `herdr` that records its argv. PATH is pinned to
@@ -489,7 +469,6 @@ hpl_setup() {
   ln -s "$HPL_ASSETS/fixture-lib.sh" "$HPL_WORK/fixture-lib.sh"
   ln -s "$HPL_ASSETS/herdr" "$HPL_STUB/herdr"
   ln -s "$HPL_ASSETS/git" "$HPL_STUB/git"
-  ln -s "$HPL_ASSETS/hpl-crash-worker" "$HPL_STUB/hpl-crash-worker"
   "$HPL_STUB/git" --version >/dev/null 2>&1 || true
   # jq lives outside /usr/bin on Homebrew installs (macOS and the Linux test
   # container alike), so link it in rather than widening the pinned PATH — a
@@ -752,19 +731,18 @@ HPL_GIT_BUDGET="${HPL_GIT_BUDGET:-2}"
 HPL_WAIT_CEILING_SECONDS="${HPL_WAIT_CEILING_SECONDS:-60}"
 HPL_WAIT_POLLS="${HPL_WAIT_POLLS:-$((HPL_WAIT_CEILING_SECONDS * 100))}"        # sleep 0.01
 HPL_WAIT_SLOW_POLLS="${HPL_WAIT_SLOW_POLLS:-$((HPL_WAIT_CEILING_SECONDS * 4))}"  # sleep 0.25
-HPL_WAIT_MATCH_POLLS="${HPL_WAIT_MATCH_POLLS:-$((HPL_WAIT_CEILING_SECONDS * 40))}" # sleep 0.025
 export HPL_WAIT_POLLS
 
-# The two bounds around the nested Bats run in "bounded Bats invocation exits
-# after detached work". They are deliberately two numbers, not one, because a
-# hang guard and an assertion are different budgets: the old single 90 s budget
-# covered the whole nested run, most of which was Bats parsing every test in
-# tests/scripts.bats to reach the one the filter selects. The nested run now
-# targets a dedicated one-test file, so the progress guard covers setup and the
-# probe itself rather than a whole-suite parse.
+# The two bounds around the nested runner invocation in test 1103,
+# "herdr-pane-labels descriptor probe closes detached worker pipes". They are
+# deliberately two numbers, not one, because a hang guard and an assertion are
+# different budgets: the old single 90 s budget covered the whole nested run,
+# most of which was the runner parsing a whole suite to reach the one test the
+# filter selects. The nested run now targets a dedicated one-test file
+# (tests/bashunit/herdr_pane_labels_descriptor_probe_test.sh), so the progress
+# guard covers setup and the probe itself rather than a whole-suite parse.
 #
-# The causal remedy docs/solutions/design-patterns/idle-machine-wall-clock-bounds-are-latent-flakes.md
-# prefers is unavailable here: a
+# The causal remedy is unavailable here: a
 # held pipe and a released one differ only in elapsed time, with no marker a test
 # could block on. So the split is the fallback, applied deliberately.
 #
@@ -776,7 +754,7 @@ export HPL_WAIT_POLLS
 # message instead of the job being killed with none.
 HPL_INNER_BATS_PROGRESS_SECONDS="${HPL_INNER_BATS_PROGRESS_SECONDS:-60}"
 # EXIT is the assertion, and the only bound here that can fire on a healthy run.
-# It covers Bats teardown and exit alone -- not the parse -- which is what takes
+# It covers runner teardown and exit alone -- not the parse -- which is what takes
 # the load sensitivity out. Sized from measurement, not intuition: the driver
 # prints its elapsed value on every run, and this is a large multiple of the
 # ~0.2 s observed under CPU saturation on a 10-core host. Must stay below
@@ -822,24 +800,6 @@ hpl_wait_for_file() {
   for _ in $(seq 1 "$HPL_WAIT_POLLS"); do
     [[ -e "$file" ]] && return 0
     sleep 0.01
-  done
-  return 1
-}
-
-# Waits for a file to CONTAIN something, not merely to exist. A detached stub
-# can write its line after the caller returns, so on a loaded machine the log
-# can be absent or empty at the moment the test reads it.
-hpl_wait_for_file_match() {
-  local file="$1" pattern="$2" _
-  for _ in $(seq 1 "$HPL_WAIT_MATCH_POLLS"); do
-    if [[ -e "$file" ]] && grep -q -- "$pattern" "$file"; then
-      # Settle briefly so a second, unwanted line would also have landed --
-      # this test asserts the log holds exactly one call, and returning the
-      # instant the first line appears would hide a duplicate.
-      sleep 0.1
-      return 0
-    fi
-    sleep 0.025
   done
   return 1
 }
@@ -927,51 +887,20 @@ hpl_location_pass() {
   hpl_wait_for_presentation_quiescence "$HPL_DEFAULT_SOCKET"
 }
 
-hpl_location_source_tokens() {
-  jq -c --arg pane "$2" '.metadata[$pane]["location-sync"].tokens // {}' "$(hpl_socket_state "$1")"
-}
 
 hpl_location_source_seq() {
   jq -r --arg pane "$2" '.metadata[$pane]["location-sync"].seq // 0' "$(hpl_socket_state "$1")"
 }
 
-hpl_git_probe() {
-  local pane="$1" cwd="$2" result_dir="$HPL_WORK/git-results" git_pid timer_pid git_status
-  mkdir -p "$result_dir"
-  env PATH="$HPL_STUB:/usr/bin:/bin" HPL_GIT_PROBE_ID="$pane" \
-    git -C "$cwd" rev-parse --show-toplevel \
-    > "$result_dir/$pane.output" 2>/dev/null &
-  git_pid=$!
-  hpl_wait_for_file "$HPL_WORK/git-started/$pane"
-  (
-    sleep 0.075
-    if kill -0 "$git_pid" 2>/dev/null; then
-      : > "$result_dir/$pane.timed-out"
-      kill "$git_pid" 2>/dev/null || true
-    fi
-  ) &
-  timer_pid=$!
-  if wait "$git_pid"; then git_status=0; else git_status=$?; fi
-  kill "$timer_pid" 2>/dev/null || true
-  wait "$timer_pid" 2>/dev/null || true
-  if [[ -e "$result_dir/$pane.timed-out" || "$git_status" -ne 0 ]]; then
-    printf '%s\n' stale > "$result_dir/$pane"
-  else
-    printf 'fresh:%s\n' "$(cat "$result_dir/$pane.output")" > "$result_dir/$pane"
-  fi
-}
 
-hpl_crash_run() {
-  "$HPL_STUB/hpl-crash-worker" "$1" "${2:-none}"
-}
 
 # Sweep modes run the script directly. The git budget mirrors hpl_location_pass: the
 # shipped 75 ms SIGKILL bound is a UI-latency budget calibrated against real
 # git on an idle machine, and a forked bash-stub probe under --jobs load loses
 # that race, degrades the pane to location_status=stale, and flakes any
-# location assertion (the pattern
-# docs/solutions/design-patterns/idle-machine-wall-clock-bounds-are-latent-flakes.md names;
-# this was its third missed call site after 543ca9e and 7f675e1).
+# location assertion. This is the idle-machine wall-clock bound pattern: a
+# budget calibrated on an unloaded host becomes a latent flake under job
+# contention, and this was its third missed call site.
 hpl_sweep_run() {
   env PATH="$HPL_STUB:/usr/bin:/bin" \
     HERDR_PANE_LABELS_STATE_DIR="$HPL_STATE" \
@@ -1051,140 +980,6 @@ hpl_namespace() {
 
 hpl_pane_state_dir() {
   printf '%s/panes/%s\n' "$(hpl_namespace "$1")" "$(hpl_key "$2")"
-}
-
-hpl_cutover_setup() {
-  hpl_setup
-  HPL_CUTOVER_HOME="$HPL_WORK/home"
-  HPL_CUTOVER_BEFORE="$HPL_WORK/cutover-before.sh"
-  HPL_CUTOVER_AFTER="$HPL_WORK/cutover-after.sh"
-  HPL_CUTOVER_TRACE="$HPL_WORK/cutover.trace"
-  mkdir -p "$HPL_CUTOVER_HOME/.local/bin" "$HPL_CUTOVER_HOME/.local/lib" \
-    "$HPL_CUTOVER_HOME/.config/herdr/plugins"
-  cp "$HPL_ENGINE" "$HPL_CUTOVER_HOME/.local/bin/herdr-pane-labels"
-  cat > "$HPL_CUTOVER_HOME/.local/bin/herdr-child" <<'SH'
-#!/bin/sh
-printf '%s\n' 'legacy herdr-child --name launcher' >&2
-exit 1
-SH
-  cp "$SOURCE_ROOT/dot_local/lib/herdr-aliases.sh" "$HPL_CUTOVER_HOME/.local/lib/herdr-aliases.sh"
-  cp "$SOURCE_ROOT/dot_local/lib/herdr-process.sh" "$HPL_CUTOVER_HOME/.local/lib/herdr-process.sh"
-  cp -R "$HPL_PLUGIN_DIR" "$HPL_CUTOVER_HOME/.config/herdr/plugins/herdr-pane-labels"
-  chmod +x "$HPL_CUTOVER_HOME/.local/bin/herdr-pane-labels" "$HPL_CUTOVER_HOME/.local/bin/herdr-child"
-  printf '%s\n' '{"result":{"sessions":[{"running":true,"socket_path":"'"$HPL_DEFAULT_SOCKET"'"}]}}' > "$HPL_WORK/sessions.json"
-  : > "$HPL_WORK/plugin.log"
-  : > "$HPL_WORK/plugin-sockets.log"
-  : > "$HPL_CUTOVER_TRACE"
-
-  cat > "$HPL_CUTOVER_HOME/.local/bin/herdr-task-sync" <<'SH'
-#!/usr/bin/env bash
-set -u
-cache="${HERDR_TASK_SYNC_STATE_DIR:-$HOME/.cache/herdr-task-sync}"
-socket="${HERDR_SOCKET_PATH:-}"
-key="$(printf '%s' "$socket" | base64 | tr '/+' '_-' | tr -d '=\n')"
-namespace="$cache/sockets/$key"
-write_socket() {
-  mkdir -p "$namespace"
-  printf 'socket_path=%s\n' "$(printf '%s' "$socket" | base64 | tr -d '\n')" > "$namespace/socket.state"
-}
-case "${1:-}" in
-  --ensure-daemon)
-    write_socket
-    if [ -f "$namespace/sweep.lock/pid" ] && kill -0 "$(cat "$namespace/sweep.lock/pid")" 2>/dev/null; then exit 0; fi
-    mkdir -p "$namespace/sweep.lock"
-    nohup bash "$0" --sweep-daemon </dev/null >/dev/null 2>&1 &
-    ;;
-  --sweep-daemon)
-    write_socket
-    mkdir -p "$namespace/sweep.lock"
-    printf '%s' "$$" > "$namespace/sweep.lock/pid"
-    trap 'rm -f "$namespace/sweep.lock/pid"; rmdir "$namespace/sweep.lock" 2>/dev/null || true; exit 0' INT TERM EXIT
-    while :; do sleep 1; done
-    ;;
-  --presentation-worker|--worker)
-    trap 'exit 0' INT TERM
-    while :; do sleep 1; done
-    ;;
-  *)
-    printf '%s\n' "$*" >> "${HPL_LEGACY_ADAPTER_LOG:-/dev/null}"
-    ;;
-esac
-SH
-  chmod +x "$HPL_CUTOVER_HOME/.local/bin/herdr-task-sync"
-
-  chezmoi_full_fixture execute-template -S "$SOURCE_ROOT" --file "$HPL_CUTOVER_BEFORE_TEMPLATE" > "$HPL_CUTOVER_BEFORE"
-  chezmoi_full_fixture execute-template -S "$SOURCE_ROOT" --file "$HPL_CUTOVER_AFTER_TEMPLATE" > "$HPL_CUTOVER_AFTER"
-  chmod +x "$HPL_CUTOVER_BEFORE" "$HPL_CUTOVER_AFTER"
-}
-
-hpl_cutover_sessions() {
-  local json='{"result":{"sessions":[]}}' socket
-  for socket in "$@"; do
-    json="$(jq -c --arg socket "$socket" '.result.sessions += [{running:true,socket_path:$socket}]' <<< "$json")"
-  done
-  printf '%s\n' "$json" > "$HPL_WORK/sessions.json"
-}
-
-hpl_cutover_run() {
-  env HOME="$HPL_CUTOVER_HOME" PATH="$HPL_STUB:/usr/bin:/bin" \
-    HPL_WORK="$HPL_WORK" HPL_DEFAULT_SOCKET="$HPL_DEFAULT_SOCKET" HPL_SOCKET_ROOT="$HPL_SOCKET_ROOT" \
-    HPL_LEGACY_ADAPTER_LOG="$HPL_WORK/legacy-adapter.log" \
-    HERDR_PANE_LABELS_CUTOVER_TRACE="$HPL_CUTOVER_TRACE" \
-    HERDR_PANE_LABELS_CUTOVER_POLL=0.01 \
-    HERDR_PANE_LABELS_CUTOVER_TEST_HOOK="${HERDR_PANE_LABELS_CUTOVER_TEST_HOOK:-}" \
-    bash "$1"
-}
-
-hpl_pid_is_live() {
-  local state
-  kill -0 "$1" 2>/dev/null || return 1
-  state="$(ps -p "$1" -o stat= 2>/dev/null)" || return 0
-  if [[ "$state" != *Z* ]]; then
-    return 0
-  fi
-  return 1
-}
-
-hpl_cutover_namespace() {
-  printf '%s/.cache/%s/sockets/%s\n' "$HPL_CUTOVER_HOME" "$1" "$(hpl_key "$2")"
-}
-
-hpl_cutover_write_socket_state() {
-  local namespace="$1" socket="$2"
-  mkdir -p "$namespace"
-  printf 'socket_path=%s\n' "$(printf '%s' "$socket" | base64 | tr -d '\n')" > "$namespace/socket.state"
-}
-
-hpl_cutover_spawn_owner() {
-  local mode="$1" socket="$2" lock="$3" pid start namespace owner_file
-  if [[ "$mode" = --worker ]]; then
-    HERDR_SOCKET_PATH="$socket" bash "$HPL_CUTOVER_HOME/.local/bin/herdr-task-sync" "$mode" --agent claude \
-      </dev/null >/dev/null 2>&1 &
-  else
-    HERDR_SOCKET_PATH="$socket" bash "$HPL_CUTOVER_HOME/.local/bin/herdr-task-sync" "$mode" \
-      </dev/null >/dev/null 2>&1 &
-  fi
-  pid=$!
-  namespace="$(hpl_cutover_namespace herdr-task-sync "$socket")"
-  hpl_cutover_write_socket_state "$namespace" "$socket"
-  mkdir -p "$namespace/$lock"
-  owner_file="$namespace/$lock/owner"
-  start="$(ps -p "$pid" -o lstart= | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-  printf 'owner_id=%s\npid=%s\nprocess_start=%s\nsocket_path=%s\n' \
-    "$(printf owner-$pid | base64 | tr -d '\n')" "$pid" \
-    "$(printf '%s' "$start" | base64 | tr -d '\n')" \
-    "$(printf '%s' "$socket" | base64 | tr -d '\n')" > "$owner_file"
-  printf '%s\n' "$pid"
-}
-
-hpl_cutover_start_old_daemon() {
-  local socket="$1" namespace pid
-  HERDR_SOCKET_PATH="$socket" HOME="$HPL_CUTOVER_HOME" \
-    "$HPL_CUTOVER_HOME/.local/bin/herdr-task-sync" --ensure-daemon
-  namespace="$(hpl_cutover_namespace herdr-task-sync "$socket")"
-  hpl_wait_for_file "$namespace/sweep.lock/pid"
-  pid="$(cat "$namespace/sweep.lock/pid")"
-  printf '%s\n' "$pid"
 }
 
 hpl_record_number() {

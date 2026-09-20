@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# post-apply: excluded
-# Inner half of a two-part probe: test_scripts_1103 in scripts_test.sh drives
-# this file under a nested tests/lib/bashunit invocation and owns its oracle.
+# Inner half of a two-part probe: test 1103 in
+# tests/bashunit/pane_labels_behavior_test.sh drives this file under a nested
+# tests/lib/bashunit invocation and owns its oracle. Not run directly by
+# `make test` -- the driver is the only supported entry point.
 source "$(dirname "${BASH_SOURCE[0]}")/test-dsl.bash"
 _bats_file_init "${BASH_SOURCE[0]}"
 
@@ -35,4 +36,11 @@ function test_herdr_pane_labels_descriptor_001_herdr_pane_labels_descriptor_chil
 
 function tear_down() { _bats_run_teardown; }
 
-function tear_down_after_script() { _bats_file_cleanup; }
+# The stub assets are per-file, not per-test: bashunit runs every test body in
+# a subshell, so an export from hpl_setup_assets inside one test never reaches
+# the next. These hooks run in the file shell, which is the only place the
+# export survives -- without them each test rebuilds the stubs and leaks its
+# own $BATS_TMPDIR/hpl-assets.* directory.
+function set_up_before_script() { hpl_setup_assets; }
+
+function tear_down_after_script() { hpl_teardown_assets; _bats_file_cleanup; }

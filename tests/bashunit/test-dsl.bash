@@ -1,24 +1,33 @@
 # Test DSL for this repo's bashunit 0.50.1 suites (tests/bashunit/*_test.sh).
 #
 # Historically a bats-core 1.14 compatibility layer (the suite migrated from
-# bats with oracle-verified parity — docs/benchmarks/
-# bashunit-full-suite-experiment.md); now the permanent vocabulary the tests
+# bats with oracle-verified parity); now the permanent vocabulary the tests
 # are written in. It exists because bashunit natively has neither `run` nor
 # implicit-assertion semantics: without the ERR trap below, a failing bare
 # command (`cd`, `grep -q`, `[ ... ]`) would NOT fail its test.
 #
 # Vocabulary policy (hybrid): keep `run`/`$status`/`$output`/assert_output-
-# style asserts as the house style; when touching a test, native bashunit
-# assert names may replace 1:1 equivalents (assert_equal -> assert_equals),
-# but never replace the `run` capture or the ERR-trap semantics.
+# style asserts as the house style; native bashunit assert names may replace
+# genuine 1:1 equivalents, but never the `run` capture or the ERR-trap
+# semantics.
+#
+# assert_equal is NOT one of those equivalents. This DSL takes bats-assert's
+# order -- $1 actual, $2 expected -- and every call in the suite is written
+# that way; bashunit's assert_equals is the reverse ($1 expected, $2 actual),
+# and additionally strips ANSI from both sides and accepts a third label
+# argument. Swapping the name alone keeps the test passing (the comparison is
+# symmetric) while labelling the computed value "expected" in the failure
+# block, which points the next debugger the wrong way. Swap the arguments too,
+# or leave the call alone.
 #
 # Semantics this DSL guarantees:
 #
 # - Failure detection is an ERR trap with errtrace (set -E, no errexit) plus
 #   the body's final exit status. This matches bats' set -eET on the same
 #   interpreter — helper-depth command failures fail the test, while the
-#   bash-3.2 quirk stays: a mid-body `[[ ]]`/`(( ))` false is inert
-#   (docs/solutions/test-failures/bats-mid-test-compound-conditionals-bypass-errexit.md).
+#   bash-3.2 quirk stays: a mid-body `[[ ]]`/`(( ))` false is inert, because
+#   bash does not run the ERR trap for a compound conditional used as a
+#   statement.
 # - `run` executes in a command substitution (subshell), captures merged
 #   stdout+stderr with trailing newlines stripped, and splits $lines on
 #   newlines with empty lines dropped — exactly bats' default capture.
@@ -34,6 +43,10 @@ status=0
 output=""
 lines=()
 
+# The handler text, installed verbatim at each `trap ... ERR` site below.
+# Those sites expand it with double quotes on purpose -- the text is fixed
+# here and must not be re-resolved when the signal fires -- so each carries a
+# bare SC2064 waiver rather than repeating this note.
 _BATS_ERR_TRAP='_bats_err_trap "$?" "$BASH_COMMAND"'
 
 _bats_err_trap() {
@@ -56,6 +69,7 @@ _bats_err_trap() {
 _bats_assert_pass() {
   trap - ERR
   bashunit::state::add_assertions_passed
+  # shellcheck disable=SC2064
   trap "$_BATS_ERR_TRAP" ERR
   return 0
 }
@@ -126,6 +140,7 @@ run() {
     output=$(< "$_bats_run_out")
   fi
   _bats_split_lines
+  # shellcheck disable=SC2064
   trap "$_BATS_ERR_TRAP" ERR
   return 0
 }
@@ -470,6 +485,7 @@ _bats_test_init() {
   # set -eET; without this a helper failing mid-way but returning 0 is green
   # here and red under bats).
   set -E
+  # shellcheck disable=SC2064
   trap "$_BATS_ERR_TRAP" ERR
   if declare -F setup >/dev/null; then
     setup
