@@ -2,6 +2,8 @@
 
 test:
 	tests/test.sh
+	tests/lifecycle.sh
+	tests/lib/bashunit -j 8 tests/bashunit/pane_labels_behavior_test.sh
 	tests/reconcile.sh
 
 lint:
