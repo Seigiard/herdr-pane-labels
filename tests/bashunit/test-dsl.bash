@@ -150,7 +150,10 @@ _bats_split_stderr_lines() {
   case $- in *f*) had_f=1 ;; esac
   set -f
   local IFS=$'\n'
-  # shellcheck disable=SC2206
+  # SC2034: stderr_lines is part of the bats `run` vocabulary this DSL mirrors
+  # (status/output/lines/stderr/stderr_lines). No test reads it yet; keep it so a
+  # test that does needs no harness change.
+  # shellcheck disable=SC2206,SC2034
   stderr_lines=( $stderr )
   if [ "$had_f" -eq 0 ]; then
     set +f
