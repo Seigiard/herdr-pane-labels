@@ -4,10 +4,22 @@ on:
   push:
   pull_request:
 
+env:
+  # Pinned so `make lint` gives the same verdict locally and in CI. An
+  # unpinned runner image silently changes the analyzer under the gate.
+  SHELLCHECK_VERSION: v0.11.0
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: make test
+      - name: Install shellcheck ${{ env.SHELLCHECK_VERSION }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.gz"
+          curl -fsSL "$url" | tar -xzf - -C "$RUNNER_TEMP"
+          sudo install "$RUNNER_TEMP/shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
       - run: make lint
