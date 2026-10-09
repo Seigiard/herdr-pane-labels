@@ -46,6 +46,11 @@ remain in the user's Herdr `config.toml`.
 
 ## Development
 
+Install Lefthook 2.2.1 or newer (`brew install lefthook` on macOS), then run
+`make install-git-hooks` once per clone. Before commit, it runs `make lint` for
+staged shell changes, including the extensionless CLI, and checks staged
+whitespace. Use the ShellCheck version documented by the CI configuration.
+
 ```bash
 make test
 make lint
