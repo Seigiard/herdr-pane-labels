@@ -1,0 +1,13 @@
+glob_matcher: doublestar
+
+pre-commit:
+  piped: true
+  jobs:
+    - name: lint
+      glob:
+        - '**/*.{sh,bash}'
+        - 'bin/herdr-pane-labels'
+      exclude: 'tests/lib/**'
+      run: make lint
+    - name: whitespace
+      run: git diff --cached --check

@@ -1,4 +1,6 @@
-.PHONY: test lint
+.PHONY: test lint install-git-hooks
+
+LEFTHOOK ?= lefthook
 
 # Every shell file in the package except the vendored runner. Built with find
 # because the suites live in tests/bashunit and tests/helpers, which a
@@ -14,3 +16,6 @@ test:
 lint:
 	bash -n $(LINT_SOURCES)
 	shellcheck --severity=warning $(LINT_SOURCES)
+
+install-git-hooks:
+	$(LEFTHOOK) install
