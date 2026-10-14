@@ -153,6 +153,23 @@ encode_key() {
   printf '%s' "${encoded//=/}"
 }
 
+agent_cwd_from_record() {
+  local pane_json="$1" has_agent="$2" session record candidate
+  [ "$has_agent" = "true" ] || return 1
+  session="$(printf '%s' "$pane_json" | jq -r '
+    if (.agent_session | type) == "object" then (.agent_session.value // "") else "" end
+  ' 2>/dev/null)" || return 1
+  [ -n "$session" ] || return 1
+  record="${HERDR_WORKTREE_IDENTITY_STATE_DIR:-$HOME/.cache/herdr-worktree-identity}/agent-cwd/$(encode_key "$session")"
+  [ -f "$record" ] || return 1
+  candidate="$(cat "$record" 2>/dev/null)" || return 1
+  case "$candidate" in
+    /*) [ -d "$candidate" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "$candidate"
+}
+
 encode_value() {
   local encoded
   encoded="$(printf '%s' "$1" | base64)"
@@ -529,6 +546,8 @@ resolve_pane_location() {
   else
     cwd="$(printf '%s' "$pane_json" | jq -r 'if (.cwd | type) == "string" then .cwd else "" end' 2>/dev/null)"
   fi
+  candidate="$(agent_cwd_from_record "$pane_json" "$has_agent")" || candidate=""
+  [ -n "$candidate" ] && cwd="$candidate"
 
   if [ -z "$cwd" ] || ! (cd "$cwd" 2>/dev/null); then
     if authoritative_worktree_deleted "$prior_root" "$prior_anchor"; then

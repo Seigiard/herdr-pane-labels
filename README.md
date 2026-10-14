@@ -44,6 +44,25 @@ and one active writer per socket.
 The package does not own sidebar rows or personal presentation settings. Those
 remain in the user's Herdr `config.toml`.
 
+## Agent checkout records
+
+For agent panes, the package reads the current checkout from the following
+input interface when the record is present and valid:
+
+```text
+${HERDR_WORKTREE_IDENTITY_STATE_DIR:-~/.cache/herdr-worktree-identity}/agent-cwd/<key>
+```
+
+`~` means `$HOME`. The `<key>` is the pane's `agent_session.value`, encoded
+with the RFC 4648 section 5 base64url alphabet (`-` and `_`), without `=`
+padding or line breaks. The record value is one line containing an absolute
+directory path. Writers should replace the record atomically with a temporary
+file and rename.
+
+If the record is missing, empty, relative, or names a directory that does not
+exist, the package falls back to the pane's `.cwd`. Non-agent panes always keep
+their existing `.cwd` or `foreground_cwd` behavior.
+
 ## Development
 
 Install Lefthook 2.2.1 or newer (`brew install lefthook` on macOS), then run
