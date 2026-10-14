@@ -2397,23 +2397,59 @@ function test_scripts_1182_herdr_pane_labels_agent_cwd_invalid_records_fall_back
   hpl_setup
   local main="$HPL_WORK/main" linked="$HPL_WORK/main/linked" record="$HERDR_WORKTREE_IDENTITY_STATE_DIR/agent-cwd/Pj4-Pg" state case_name
   local common="$main/.git"
+  # #given
   mkdir -p "$main" "$linked" "$common" "$HERDR_WORKTREE_IDENTITY_STATE_DIR/agent-cwd"
   hpl_git_location_fixture "$main" "$main" "$common" refs/heads/main
   hpl_mark_linked_worktree "$linked" "$common/worktrees/linked"
   hpl_git_location_fixture "$linked" "$linked" "$common" refs/heads/feature
-  hpl_set_location_agent_pane "$HPL_DEFAULT_SOCKET" pane-1 tab-1 "$main" '>>>>'
+  hpl_git_location_fixture linked "$linked" "$common" refs/heads/feature
 
   for case_name in missing empty relative; do
+    # #given
+    hpl_set_location_agent_pane "$HPL_DEFAULT_SOCKET" pane-1 tab-1 "$main" '>>>>'
+    hpl_transform_state "$HPL_DEFAULT_SOCKET" 'del(.metadata["pane-1"])'
+    HPL_STATE="$HPL_WORK/state-$case_name"
+    mkdir -p "$HPL_STATE"
     rm -f "$record"
     case "$case_name" in
       empty) : > "$record" ;;
       relative) printf '%s\n' linked > "$record" ;;
     esac
-    hpl_location_pass
+    # #when
+    if [ "$case_name" = relative ]; then
+      (cd "$main" && hpl_location_pass)
+    else
+      hpl_location_pass
+    fi
+    # #then
     state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
-    assert_equal "$(jq -c '.panes[0].tokens | {repo,worktree,branch,git_ref}' "$state")" \
-      "$(jq -nc --arg ref "$HPL_ICON_BRANCH main" '{repo:"main",worktree:"main",branch:"main",git_ref:$ref}')"
+    assert_equal "$(jq -c '.panes[0].tokens | {repo,worktree,branch,location_status:(.location_status // ""),git_ref}' "$state")" \
+      "$(jq -nc --arg ref "$HPL_ICON_BRANCH main" '{repo:"main",worktree:"main",branch:"main",location_status:"",git_ref:$ref}')"
   done
+}
+
+function test_scripts_1189_herdr_pane_labels_agent_cwd_control_character_record_falls_() {
+  _bats_test_init 1189 'herdr-pane-labels control-character agent-cwd records fall back to the agent launch cwd'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local main="$HPL_WORK/main" invalid state
+  invalid="$HPL_WORK/linked$(printf '\037')record"
+  local common="$main/.git"
+  # #given
+  mkdir -p "$main" "$invalid" "$common" "$HERDR_WORKTREE_IDENTITY_STATE_DIR/agent-cwd"
+  hpl_git_location_fixture "$main" "$main" "$common" refs/heads/main
+  hpl_mark_linked_worktree "$invalid" "$common/worktrees/linked"
+  hpl_git_location_fixture "$invalid" "$invalid" "$common" refs/heads/feature
+  hpl_set_location_agent_pane "$HPL_DEFAULT_SOCKET" pane-1 tab-1 "$main" '>>>>'
+  printf '%s\n' "$invalid" > "$HERDR_WORKTREE_IDENTITY_STATE_DIR/agent-cwd/Pj4-Pg"
+
+  # #when
+  run hpl_event_run
+  # #then
+  assert_success
+  state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
+  assert_equal "$(jq -c '.panes[0].tokens | {repo,worktree,branch,git_ref}' "$state")" \
+    "$(jq -nc --arg ref "$HPL_ICON_BRANCH main" '{repo:"main",worktree:"main",branch:"main",git_ref:$ref}')"
 }
 
 function test_scripts_1183_herdr_pane_labels_agent_cwd_missing_session_falls_back_() {

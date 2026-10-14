@@ -397,7 +397,8 @@ elif [ "$1" = "--git-dir" ]; then
   cwd="gitdir:$2"
   shift 2
 fi
-fixture="$(awk -F "$(printf '\037')" -v cwd="$cwd" '$1 == cwd { print $2; exit }' "$HPL_WORK/git-fixtures/registry" 2>/dev/null)"
+cwd_key="$(printf '%s' "$cwd" | base64 | tr -d '\n')"
+fixture="$(awk -F "$(printf '\037')" -v key="$cwd_key" '$1 == key { print $2; exit }' "$HPL_WORK/git-fixtures/registry" 2>/dev/null)"
 if [ -d "$fixture" ]; then
   printf '%s\n' "$command_args" >> "$fixture/calls"
   printf '%s' "${LC_ALL:-}" > "$fixture/locale"
@@ -830,7 +831,7 @@ hpl_wait_for_socket_completion() {
 }
 
 hpl_git_fixture() {
-  local id fixture next="$HPL_WORK/git-fixtures/next"
+  local id fixture key next="$HPL_WORK/git-fixtures/next"
   mkdir -p "$HPL_WORK/git-fixtures"
   id="$(cat "$next" 2>/dev/null || printf '%s' 1)"
   printf '%s' $((id + 1)) > "$next"
@@ -841,7 +842,8 @@ hpl_git_fixture() {
   printf '%s' "${3:-0}" > "$fixture/status"
   printf '%s\n' "${5:-}" > "$fixture/stderr"
   : > "$fixture/calls"
-  printf '%s\037%s\n' "$1" "$fixture" >> "$HPL_WORK/git-fixtures/registry"
+  key="$(printf '%s' "$1" | base64 | tr -d '\n')"
+  printf '%s\037%s\n' "$key" "$fixture" >> "$HPL_WORK/git-fixtures/registry"
   [[ "${4:-ready}" = "block" ]] && : > "$fixture/block"
   return 0
 }
@@ -860,7 +862,9 @@ hpl_mark_linked_worktree() {
 }
 
 hpl_git_fixture_dir() {
-  awk -F "$(printf '\037')" -v cwd="$1" '$1 == cwd { print $2; exit }' \
+  local key
+  key="$(printf '%s' "$1" | base64 | tr -d '\n')"
+  awk -F "$(printf '\037')" -v key="$key" '$1 == key { print $2; exit }' \
     "$HPL_WORK/git-fixtures/registry"
 }
 
