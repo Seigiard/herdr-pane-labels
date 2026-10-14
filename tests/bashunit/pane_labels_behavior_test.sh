@@ -2447,6 +2447,8 @@ function test_scripts_1189_herdr_pane_labels_agent_cwd_control_character_record_
   run hpl_event_run
   # #then
   assert_success
+  run hpl_wait_for_presentation_quiescence "$HPL_DEFAULT_SOCKET"
+  assert_success
   state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
   assert_equal "$(jq -c '.panes[0].tokens | {repo,worktree,branch,git_ref}' "$state")" \
     "$(jq -nc --arg ref "$HPL_ICON_BRANCH main" '{repo:"main",worktree:"main",branch:"main",git_ref:$ref}')"
