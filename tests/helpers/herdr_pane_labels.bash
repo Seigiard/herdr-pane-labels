@@ -43,6 +43,7 @@ HPL_ICON_STALE="$(printf '\356\252\202')"    # nf-cod-history U+EA82
 hpl_teardown() {
   [[ -n "${HPL_WORK:-}" ]] && rm -rf "$HPL_WORK" || true
   unset HPL_WORK HPL_STUB HPL_STATE HPL_LOG HPL_DEFAULT_SOCKET HPL_SOCKET_ROOT
+  unset HERDR_WORKTREE_IDENTITY_STATE_DIR
 }
 
 # The four stub scripts and the fixture library are invariant: they read
@@ -454,6 +455,7 @@ hpl_setup() {
   HPL_DEFAULT_SOCKET="$HPL_WORK/session.sock"
   HPL_SOCKET_ROOT="$HPL_WORK/sockets"
   export HPL_WORK HPL_DEFAULT_SOCKET HPL_SOCKET_ROOT
+  export HERDR_WORKTREE_IDENTITY_STATE_DIR="$HPL_WORK/agent-cwd-state"
   export HERDR_SOCKET_PATH="$HPL_DEFAULT_SOCKET"
   mkdir -p "$HPL_STUB" "$HPL_STATE" "$HPL_SOCKET_ROOT/socket-1"
   : > "$HPL_LOG"
@@ -611,6 +613,19 @@ hpl_set_agent_pane() {
       {pane_id:$pane,tab_id:$tab,workspace_id:$workspace,terminal_id:$terminal,
        revision:1,state_change_seq:1,agent:$runtime,label:"old",tokens:{}}
       | if $name == "" then . else .name = $name end')"
+  hpl_set_pane "$socket" "$record"
+}
+
+hpl_set_location_agent_pane() {
+  local socket="$1" pane="$2" tab="$3" cwd="$4" session="${5:-}" has_session=false record
+  [ "$#" -lt 5 ] || has_session=true
+  record="$(jq -cn --arg pane "$pane" --arg tab "$tab" --arg cwd "$cwd" --arg session "$session" \
+    --argjson has_session "$has_session" '
+      {pane_id:$pane,tab_id:$tab,workspace_id:"ws-1",terminal_id:("term-" + $pane),
+       revision:1,agent:"claude",cwd:$cwd,label:"old",tokens:{}}
+      | if $has_session then
+          .agent_session = {source:"claude-code",agent:"claude",kind:"session",value:$session}
+        else . end')"
   hpl_set_pane "$socket" "$record"
 }
 

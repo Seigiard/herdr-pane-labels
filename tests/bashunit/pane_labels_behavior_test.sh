@@ -2331,6 +2331,170 @@ function test_scripts_1179_herdr_pane_labels_names_an_agent_whose_fresh_pane_rep
   assert_equal "$(jq -r '.panes[0].label' "$state")" "cc:$alias"
 }
 
+function test_scripts_1180_herdr_pane_labels_agent_cwd_record_overrides_agent_cwd_() {
+  _bats_test_init 1180 'herdr-pane-labels agent-cwd record overrides an agent launch cwd'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local main="$HPL_WORK/main" linked="$HPL_WORK/linked" state
+  local common="$main/.git"
+  mkdir -p "$main" "$linked" "$common" "$HERDR_WORKTREE_IDENTITY_STATE_DIR/agent-cwd"
+  hpl_mark_linked_worktree "$linked" "$common/worktrees/linked"
+  hpl_git_location_fixture "$main" "$main" "$common" refs/heads/main
+  hpl_git_location_fixture "$linked" "$linked" "$common" refs/heads/feature
+  hpl_set_location_agent_pane "$HPL_DEFAULT_SOCKET" pane-1 tab-1 "$main" '>>>>'
+  printf '%s\n' "$linked" > "$HERDR_WORKTREE_IDENTITY_STATE_DIR/agent-cwd/Pj4-Pg"
+
+  hpl_location_pass
+  state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
+  assert_equal "$(jq -c '.panes[0].tokens | {repo,worktree,branch,git_ref}' "$state")" \
+    "$(jq -nc --arg ref "$HPL_ICON_WORKTREE feature" '{repo:"main",worktree:"linked",branch:"feature",git_ref:$ref}')"
+}
+
+function test_scripts_1188_herdr_pane_labels_agent_cwd_record_is_reread_each_pass() {
+  _bats_test_init 1188 'herdr-pane-labels rereads an agent-cwd record on each location pass'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local main="$HPL_WORK/main" linked="$HPL_WORK/linked" state
+  local common="$main/.git"
+  mkdir -p "$main" "$linked" "$common" "$HERDR_WORKTREE_IDENTITY_STATE_DIR/agent-cwd"
+  hpl_mark_linked_worktree "$linked" "$common/worktrees/linked"
+  hpl_git_location_fixture "$main" "$main" "$common" refs/heads/main
+  hpl_git_location_fixture "$linked" "$linked" "$common" refs/heads/feature
+  hpl_set_location_agent_pane "$HPL_DEFAULT_SOCKET" pane-1 tab-1 "$main" '>>>>'
+  printf '%s\n' "$main" > "$HERDR_WORKTREE_IDENTITY_STATE_DIR/agent-cwd/Pj4-Pg"
+
+  hpl_location_pass
+  state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
+  assert_equal "$(jq -c '.panes[0].tokens | {repo,worktree,branch,git_ref}' "$state")" \
+    "$(jq -nc --arg ref "$HPL_ICON_BRANCH main" '{repo:"main",worktree:"main",branch:"main",git_ref:$ref}')"
+
+  printf '%s\n' "$linked" > "$HERDR_WORKTREE_IDENTITY_STATE_DIR/agent-cwd/Pj4-Pg"
+  hpl_location_pass
+  assert_equal "$(jq -c '.panes[0].tokens | {repo,worktree,branch,git_ref}' "$state")" \
+    "$(jq -nc --arg ref "$HPL_ICON_WORKTREE feature" '{repo:"main",worktree:"linked",branch:"feature",git_ref:$ref}')"
+}
+
+function test_scripts_1181_herdr_pane_labels_agent_cwd_stale_record_falls_back_to_() {
+  _bats_test_init 1181 'herdr-pane-labels stale agent-cwd record falls back to the agent launch cwd'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local main="$HPL_WORK/main" missing="$HPL_WORK/missing" state
+  local common="$main/.git"
+  mkdir -p "$main" "$common" "$HERDR_WORKTREE_IDENTITY_STATE_DIR/agent-cwd"
+  hpl_git_location_fixture "$main" "$main" "$common" refs/heads/main
+  hpl_set_location_agent_pane "$HPL_DEFAULT_SOCKET" pane-1 tab-1 "$main" '>>>>'
+  printf '%s\n' "$missing" > "$HERDR_WORKTREE_IDENTITY_STATE_DIR/agent-cwd/Pj4-Pg"
+
+  hpl_location_pass
+  state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
+  assert_equal "$(jq -c '.panes[0].tokens | {repo,worktree,branch,git_ref}' "$state")" \
+    "$(jq -nc --arg ref "$HPL_ICON_BRANCH main" '{repo:"main",worktree:"main",branch:"main",git_ref:$ref}')"
+}
+
+function test_scripts_1182_herdr_pane_labels_agent_cwd_invalid_records_fall_back_() {
+  _bats_test_init 1182 'herdr-pane-labels missing empty and relative agent-cwd records fall back to the agent launch cwd'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local main="$HPL_WORK/main" linked="$HPL_WORK/main/linked" record="$HERDR_WORKTREE_IDENTITY_STATE_DIR/agent-cwd/Pj4-Pg" state case_name
+  local common="$main/.git"
+  mkdir -p "$main" "$linked" "$common" "$HERDR_WORKTREE_IDENTITY_STATE_DIR/agent-cwd"
+  hpl_git_location_fixture "$main" "$main" "$common" refs/heads/main
+  hpl_mark_linked_worktree "$linked" "$common/worktrees/linked"
+  hpl_git_location_fixture "$linked" "$linked" "$common" refs/heads/feature
+  hpl_set_location_agent_pane "$HPL_DEFAULT_SOCKET" pane-1 tab-1 "$main" '>>>>'
+
+  for case_name in missing empty relative; do
+    rm -f "$record"
+    case "$case_name" in
+      empty) : > "$record" ;;
+      relative) printf '%s\n' linked > "$record" ;;
+    esac
+    hpl_location_pass
+    state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
+    assert_equal "$(jq -c '.panes[0].tokens | {repo,worktree,branch,git_ref}' "$state")" \
+      "$(jq -nc --arg ref "$HPL_ICON_BRANCH main" '{repo:"main",worktree:"main",branch:"main",git_ref:$ref}')"
+  done
+}
+
+function test_scripts_1183_herdr_pane_labels_agent_cwd_missing_session_falls_back_() {
+  _bats_test_init 1183 'herdr-pane-labels a missing agent session falls back to the agent launch cwd'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local main="$HPL_WORK/main" linked="$HPL_WORK/linked" state
+  local common="$main/.git"
+  mkdir -p "$main" "$linked" "$common" "$HERDR_WORKTREE_IDENTITY_STATE_DIR/agent-cwd"
+  hpl_git_location_fixture "$main" "$main" "$common" refs/heads/main
+  hpl_mark_linked_worktree "$linked" "$common/worktrees/linked"
+  hpl_git_location_fixture "$linked" "$linked" "$common" refs/heads/feature
+
+  hpl_set_location_agent_pane "$HPL_DEFAULT_SOCKET" pane-1 tab-1 "$main"
+  printf '%s\n' "$linked" > "$HERDR_WORKTREE_IDENTITY_STATE_DIR/agent-cwd/Pj4-Pg"
+  hpl_location_pass
+  state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
+  assert_equal "$(jq -c '.panes[0].tokens | {repo,worktree,branch,git_ref}' "$state")" \
+    "$(jq -nc --arg ref "$HPL_ICON_BRANCH main" '{repo:"main",worktree:"main",branch:"main",git_ref:$ref}')"
+}
+
+function test_scripts_1184_herdr_pane_labels_agent_cwd_state_directory_override_a() {
+  _bats_test_init 1184 'herdr-pane-labels uses the configured agent-cwd state directory'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local main="$HPL_WORK/main" linked="$HPL_WORK/linked" state_dir="$HPL_WORK/custom-state" state
+  local common="$main/.git"
+  mkdir -p "$main" "$linked" "$common" "$state_dir/agent-cwd"
+  hpl_mark_linked_worktree "$linked" "$common/worktrees/linked"
+  hpl_git_location_fixture "$main" "$main" "$common" refs/heads/main
+  hpl_git_location_fixture "$linked" "$linked" "$common" refs/heads/feature
+  hpl_set_location_agent_pane "$HPL_DEFAULT_SOCKET" pane-1 tab-1 "$main" '>>>>'
+  export HERDR_WORKTREE_IDENTITY_STATE_DIR="$state_dir"
+  printf '%s\n' "$linked" > "$state_dir/agent-cwd/Pj4-Pg"
+
+  hpl_location_pass
+  state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
+  assert_equal "$(jq -c '.panes[0].tokens | {repo,worktree,branch,git_ref}' "$state")" \
+    "$(jq -nc --arg ref "$HPL_ICON_WORKTREE feature" '{repo:"main",worktree:"linked",branch:"feature",git_ref:$ref}')"
+}
+
+function test_scripts_1185_herdr_pane_labels_agent_cwd_default_state_directory_uses() {
+  _bats_test_init 1185 'herdr-pane-labels uses HOME for the default agent-cwd state directory'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local main="$HPL_WORK/main" linked="$HPL_WORK/linked" home="$HPL_WORK/home" state
+  local common="$main/.git"
+  mkdir -p "$main" "$linked" "$common" "$home/.cache/herdr-worktree-identity/agent-cwd"
+  hpl_mark_linked_worktree "$linked" "$common/worktrees/linked"
+  hpl_git_location_fixture "$main" "$main" "$common" refs/heads/main
+  hpl_git_location_fixture "$linked" "$linked" "$common" refs/heads/feature
+  hpl_set_location_agent_pane "$HPL_DEFAULT_SOCKET" pane-1 tab-1 "$main" '>>>>'
+  unset HERDR_WORKTREE_IDENTITY_STATE_DIR
+  printf '%s\n' "$linked" > "$home/.cache/herdr-worktree-identity/agent-cwd/Pj4-Pg"
+
+  HOME="$home" hpl_location_pass
+  state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
+  assert_equal "$(jq -c '.panes[0].tokens | {repo,worktree,branch,git_ref}' "$state")" \
+    "$(jq -nc --arg ref "$HPL_ICON_WORKTREE feature" '{repo:"main",worktree:"linked",branch:"feature",git_ref:$ref}')"
+}
+
+function test_scripts_1186_herdr_pane_labels_non_agent_ignores_agent_cwd_record() {
+  _bats_test_init 1186 'herdr-pane-labels non-agent panes ignore matching agent-cwd records'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local main="$HPL_WORK/main" linked="$HPL_WORK/linked" state
+  local common="$main/.git"
+  mkdir -p "$main" "$linked" "$common" "$HERDR_WORKTREE_IDENTITY_STATE_DIR/agent-cwd"
+  hpl_mark_linked_worktree "$linked" "$common/worktrees/linked"
+  hpl_git_location_fixture "$main" "$main" "$common" refs/heads/main
+  hpl_git_location_fixture "$linked" "$linked" "$common" refs/heads/feature
+  hpl_set_pane "$HPL_DEFAULT_SOCKET" "$(hpl_process_pane_json pane-1 tab-1 "$main" present "$linked" | jq -c '.agent_session = {source:"claude-code",agent:"claude",kind:"session",value:">>>>"}')"
+  hpl_set_process_label pane-1 worker
+  printf '%s\n' "$main" > "$HERDR_WORKTREE_IDENTITY_STATE_DIR/agent-cwd/Pj4-Pg"
+
+  hpl_location_pass
+  state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
+  assert_equal "$(jq -c '.panes[0].tokens | {repo,worktree,branch,git_ref}' "$state")" \
+    "$(jq -nc --arg ref "$HPL_ICON_WORKTREE feature" '{repo:"main",worktree:"linked",branch:"feature",git_ref:$ref}')"
+}
+
 function tear_down() { _bats_run_teardown; }
 
 # The stub assets are per-file, not per-test: bashunit runs every test body in
