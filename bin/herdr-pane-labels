@@ -154,7 +154,7 @@ encode_key() {
 }
 
 agent_cwd_from_record() {
-  local pane_json="$1" has_agent="$2" session record candidate
+  local pane_json="$1" has_agent="$2" session record candidate line_count
   [ "$has_agent" = "true" ] || return 1
   session="$(printf '%s' "$pane_json" | jq -r '
     if (.agent_session | type) == "object" then (.agent_session.value // "") else "" end
@@ -162,8 +162,14 @@ agent_cwd_from_record() {
   [ -n "$session" ] || return 1
   record="${HERDR_WORKTREE_IDENTITY_STATE_DIR:-$HOME/.cache/herdr-worktree-identity}/agent-cwd/$(encode_key "$session")"
   [ -f "$record" ] || return 1
+  if LC_ALL=C grep -q '[[:cntrl:]]' "$record" 2>/dev/null; then
+    return 1
+  fi
+  line_count="$(wc -l < "$record" 2>/dev/null)" || return 1
+  [ "$line_count" -le 1 ] || return 1
   candidate="$(cat "$record" 2>/dev/null)" || return 1
   case "$candidate" in
+    *$'\n'*) return 1 ;;
     /*) [ -d "$candidate" ] || return 1 ;;
     *) return 1 ;;
   esac
