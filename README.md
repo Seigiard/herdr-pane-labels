@@ -10,6 +10,8 @@ changes that do not produce an event.
 - Herdr 0.8.2 or newer
 - Bash 3.2 or newer, `jq`, `awk`, and `git`
 - macOS or Linux
+- [my-mac-setup](https://github.com/Seigiard/my-mac-setup) with
+  `~/.local/lib/herdr-process.sh` at API 1
 
 ## Install
 
@@ -20,7 +22,10 @@ herdr plugin enable seigi.pane-labels
 
 Use a reviewed immutable release or commit in managed environments. The build
 step installs the package's shell boundary at `~/.local/bin/herdr-pane-labels`
-and its private runtime libraries at `~/.local/lib`. `herdr-child` and
+and its private runtime libraries at `~/.local/lib/herdr-pane-labels/`. The shared
+`~/.local/lib/herdr-process.sh` library is owned by `my-mac-setup` and is never
+installed or replaced by this package. A missing or incompatible shared library is
+an installation error; run `chezmoi apply` to restore it. `herdr-child` and
 `herdr-peer-alias` use only this supported interface:
 
 ```bash

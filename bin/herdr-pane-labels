@@ -17,11 +17,30 @@ script_path() {
 
 SELF="$(script_path)" || exit 0
 SCRIPT_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd -P)" || exit 0
-# The deployed library path is resolved relative to this script.
-# shellcheck disable=SC1091
-source "$SCRIPT_DIR/../lib/herdr-aliases.sh" || exit 0
-# shellcheck disable=SC1091
-source "$SCRIPT_DIR/../lib/herdr-process.sh" || exit 0
+# The alias library is package-owned. The checkout keeps it beside this script;
+# the installed shim keeps it under the package-owned library directory.
+if [ -f "$SCRIPT_DIR/../lib/herdr-aliases.sh" ]; then
+  ALIASES_LIBRARY="$SCRIPT_DIR/../lib/herdr-aliases.sh"
+else
+  ALIASES_LIBRARY="$HOME/.local/lib/herdr-pane-labels/herdr-aliases.sh"
+fi
+# shellcheck disable=SC1090
+source "$ALIASES_LIBRARY" || exit 1
+
+PROCESS_LIBRARY="$HOME/.local/lib/herdr-process.sh"
+process_library_error() {
+  local found="${HERDR_PROCESS_API:-}"
+  [ -n "$found" ] || found=none
+  printf 'herdr-pane-labels: herdr-process.sh API 1 required, found %s; run chezmoi apply\n' "$found" >&2
+  exit 1
+}
+
+if [ ! -f "$PROCESS_LIBRARY" ]; then
+  process_library_error
+fi
+# shellcheck disable=SC1090
+source "$PROCESS_LIBRARY" || process_library_error
+[ "${HERDR_PROCESS_API:-}" = 1 ] || process_library_error
 
 STATE_DIR="${HERDR_PANE_LABELS_STATE_DIR:-$HOME/.cache/herdr-pane-labels}"
 LOCATION_SOURCE_ID="location-sync"
@@ -235,9 +254,11 @@ max_number() {
 }
 
 claim_owner_id=""
+claim_recovery_key=""
+claim_recovery_status=1
 
 recover_claim() {
-  local lock="$1" attempt="$2" owner pid start socket identity_status
+  local lock="$1" attempt="$2" owner pid start format socket identity_key identity_status
   owner="$(read_state_field "$lock/owner" owner_id)"
   if [ -z "$owner" ]; then
     [ "$attempt" -ge 3 ] || return 1
@@ -249,11 +270,19 @@ recover_claim() {
   fi
   pid="$(record_number "$lock/owner" pid)"
   start="$(read_state_field "$lock/owner" process_start)"
+  format="$(sed -n 's/^identity_format=//p' "$lock/owner" 2>/dev/null)"
   socket="$(read_state_field "$lock/owner" socket_path)"
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     if [ "$socket" = "$SOCKET_PATH" ]; then
-      process_start_matches "$pid" "$start"
-      identity_status=$?
+      identity_key="$pid|$start|$format|$socket"
+      if [ "$identity_key" = "$claim_recovery_key" ]; then
+        identity_status="$claim_recovery_status"
+      else
+        process_start_matches "$pid" "$start" "$format"
+        identity_status=$?
+        claim_recovery_key="$identity_key"
+        claim_recovery_status="$identity_status"
+      fi
       [ "$identity_status" -eq 1 ] || return 1
     fi
   fi
@@ -265,6 +294,8 @@ recover_claim() {
 
 acquire_claim() {
   local lock="$1" attempts="$2" attempt=0 owner start owner_record
+  claim_recovery_key=""
+  claim_recovery_status=1
   while [ "$attempt" -lt "$attempts" ]; do
     attempt=$((attempt + 1))
     if mkdir "$lock" 2>/dev/null; then
@@ -276,6 +307,7 @@ acquire_claim() {
       owner_record="owner_id=$(encode_value "$owner")
 pid=$$
 process_start=$(encode_value "$start")
+identity_format=ps-lstart-c-utc-v1
 socket_path=$(encode_value "$SOCKET_PATH")"
       if ! atomic_write "$lock/owner" "$owner_record"; then
         rmdir "$lock" 2>/dev/null || true
@@ -1820,13 +1852,14 @@ run_sweep_daemon() {
   until start="$(process_start_marker "$$")"; do
     marker_attempt=$((marker_attempt + 1))
     if [ "$marker_attempt" -ge 3 ]; then
-      rm -f "$SWEEP_LOCK_DIR/pid" 2>/dev/null
+      rm -f "$SWEEP_LOCK_DIR/pid" "$SWEEP_LOCK_DIR/start" "$SWEEP_LOCK_DIR/identity_format" 2>/dev/null
       rmdir "$SWEEP_LOCK_DIR" 2>/dev/null
       exit 0
     fi
     sleep 0.01
   done
   printf '%s\n' "$start" > "$SWEEP_LOCK_DIR/start" 2>/dev/null
+  printf '%s\n' ps-lstart-c-utc-v1 > "$SWEEP_LOCK_DIR/identity_format" 2>/dev/null
   # Two traps, not one: a TERM handler that only cleans up would let the loop
   # carry on after it dropped its own lock, and the next hook would then start
   # a second daemon beside the first.
@@ -1834,7 +1867,7 @@ run_sweep_daemon() {
   # The cleanup releases the lock only while this daemon still owns it. A
   # dying daemon that cleared its successor's lock left no daemon running.
   trap 'if [ "$(cat "$SWEEP_LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; then
-          rm -f "$SWEEP_LOCK_DIR/pid" "$SWEEP_LOCK_DIR/start"
+          rm -f "$SWEEP_LOCK_DIR/pid" "$SWEEP_LOCK_DIR/start" "$SWEEP_LOCK_DIR/identity_format"
           rmdir "$SWEEP_LOCK_DIR" 2>/dev/null
         fi' EXIT
   trap 'exit 0' INT TERM
@@ -1858,7 +1891,7 @@ run_sweep_daemon() {
 # Called by the herdr plugin on startup and on agent-status events. A live
 # daemon makes this a no-op; a lock left behind by a killed daemon is cleared.
 ensure_sweep_daemon() {
-  local self="$1" pid start identity_status startup_attempt=0
+  local self="$1" pid start format identity_status startup_attempt=0
   [ -z "${HERDR_PANE_LABELS_TEST_NO_DAEMON:-}" ] || return 0
   if [ -d "$SWEEP_LOCK_DIR" ]; then
     while [ "$startup_attempt" -lt 100 ]; do
@@ -1876,12 +1909,13 @@ ensure_sweep_daemon() {
     done
     pid="$(cat "$SWEEP_LOCK_DIR/pid" 2>/dev/null)"
     start="$(cat "$SWEEP_LOCK_DIR/start" 2>/dev/null)"
+    format="$(cat "$SWEEP_LOCK_DIR/identity_format" 2>/dev/null)"
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      process_start_matches "$pid" "$start"
+      process_start_matches "$pid" "$start" "$format"
       identity_status=$?
       [ "$identity_status" -eq 1 ] || return 0
     fi
-    rm -f "$SWEEP_LOCK_DIR/pid" "$SWEEP_LOCK_DIR/start" 2>/dev/null
+    rm -f "$SWEEP_LOCK_DIR/pid" "$SWEEP_LOCK_DIR/start" "$SWEEP_LOCK_DIR/identity_format" 2>/dev/null
     rmdir "$SWEEP_LOCK_DIR" 2>/dev/null
   fi
   # herdr reaps the process group of a plugin hook once the hook exits, and a
