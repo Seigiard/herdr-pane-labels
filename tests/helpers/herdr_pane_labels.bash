@@ -43,6 +43,7 @@ HPL_ICON_STALE="$(printf '\356\252\202')"    # nf-cod-history U+EA82
 hpl_teardown() {
   [[ -n "${HPL_WORK:-}" ]] && rm -rf "$HPL_WORK" || true
   unset HPL_WORK HPL_STUB HPL_STATE HPL_LOG HPL_DEFAULT_SOCKET HPL_SOCKET_ROOT
+  unset HERDR_WORKTREE_IDENTITY_STATE_DIR
 }
 
 # The four stub scripts and the fixture library are invariant: they read
@@ -396,7 +397,8 @@ elif [ "$1" = "--git-dir" ]; then
   cwd="gitdir:$2"
   shift 2
 fi
-fixture="$(awk -F "$(printf '\037')" -v cwd="$cwd" '$1 == cwd { print $2; exit }' "$HPL_WORK/git-fixtures/registry" 2>/dev/null)"
+cwd_key="$(printf '%s' "$cwd" | base64 | tr -d '\n')"
+fixture="$(awk -F "$(printf '\037')" -v key="$cwd_key" '$1 == key { print $2; exit }' "$HPL_WORK/git-fixtures/registry" 2>/dev/null)"
 if [ -d "$fixture" ]; then
   printf '%s\n' "$command_args" >> "$fixture/calls"
   printf '%s' "${LC_ALL:-}" > "$fixture/locale"
@@ -454,6 +456,7 @@ hpl_setup() {
   HPL_DEFAULT_SOCKET="$HPL_WORK/session.sock"
   HPL_SOCKET_ROOT="$HPL_WORK/sockets"
   export HPL_WORK HPL_DEFAULT_SOCKET HPL_SOCKET_ROOT
+  export HERDR_WORKTREE_IDENTITY_STATE_DIR="$HPL_WORK/agent-cwd-state"
   export HERDR_SOCKET_PATH="$HPL_DEFAULT_SOCKET"
   mkdir -p "$HPL_STUB" "$HPL_STATE" "$HPL_SOCKET_ROOT/socket-1"
   : > "$HPL_LOG"
@@ -611,6 +614,19 @@ hpl_set_agent_pane() {
       {pane_id:$pane,tab_id:$tab,workspace_id:$workspace,terminal_id:$terminal,
        revision:1,state_change_seq:1,agent:$runtime,label:"old",tokens:{}}
       | if $name == "" then . else .name = $name end')"
+  hpl_set_pane "$socket" "$record"
+}
+
+hpl_set_location_agent_pane() {
+  local socket="$1" pane="$2" tab="$3" cwd="$4" session="${5:-}" has_session=false record
+  [ "$#" -lt 5 ] || has_session=true
+  record="$(jq -cn --arg pane "$pane" --arg tab "$tab" --arg cwd "$cwd" --arg session "$session" \
+    --argjson has_session "$has_session" '
+      {pane_id:$pane,tab_id:$tab,workspace_id:"ws-1",terminal_id:("term-" + $pane),
+       revision:1,agent:"claude",cwd:$cwd,label:"old",tokens:{}}
+      | if $has_session then
+          .agent_session = {source:"claude-code",agent:"claude",kind:"session",value:$session}
+        else . end')"
   hpl_set_pane "$socket" "$record"
 }
 
@@ -815,7 +831,7 @@ hpl_wait_for_socket_completion() {
 }
 
 hpl_git_fixture() {
-  local id fixture next="$HPL_WORK/git-fixtures/next"
+  local id fixture key next="$HPL_WORK/git-fixtures/next"
   mkdir -p "$HPL_WORK/git-fixtures"
   id="$(cat "$next" 2>/dev/null || printf '%s' 1)"
   printf '%s' $((id + 1)) > "$next"
@@ -826,7 +842,8 @@ hpl_git_fixture() {
   printf '%s' "${3:-0}" > "$fixture/status"
   printf '%s\n' "${5:-}" > "$fixture/stderr"
   : > "$fixture/calls"
-  printf '%s\037%s\n' "$1" "$fixture" >> "$HPL_WORK/git-fixtures/registry"
+  key="$(printf '%s' "$1" | base64 | tr -d '\n')"
+  printf '%s\037%s\n' "$key" "$fixture" >> "$HPL_WORK/git-fixtures/registry"
   [[ "${4:-ready}" = "block" ]] && : > "$fixture/block"
   return 0
 }
@@ -845,7 +862,9 @@ hpl_mark_linked_worktree() {
 }
 
 hpl_git_fixture_dir() {
-  awk -F "$(printf '\037')" -v cwd="$1" '$1 == cwd { print $2; exit }' \
+  local key
+  key="$(printf '%s' "$1" | base64 | tr -d '\n')"
+  awk -F "$(printf '\037')" -v key="$key" '$1 == key { print $2; exit }' \
     "$HPL_WORK/git-fixtures/registry"
 }
 
