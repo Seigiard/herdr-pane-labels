@@ -384,10 +384,9 @@ function test_scripts_1210_herdr_pane_labels_calls_the_shared_matcher_with_v1_fo
   _bats_test_init 1210 'herdr-pane-labels calls the shared matcher with the v1 format'
   command -v jq >/dev/null || skip "jq not available"
   hpl_setup
-  local namespace lock marker calls="$HPL_WORK/process-matcher.calls"
+  local namespace marker owner_record calls="$HPL_WORK/process-matcher.calls"
   namespace="$(hpl_namespace "$HPL_DEFAULT_SOCKET")"
   HERDR_PANE_LABELS_TEST_NO_PRESENTATION=1 hpl_event_run
-  mkdir "$namespace/presentation-inbox.lock"
   marker="$(source "$SOURCE_ROOT/tests/fixtures/herdr-process.sh"; process_start_marker "$$")"
   cat > "$HPL_HOME/.local/lib/herdr-process.sh" <<SH
 $(sed 's/^process_start_matches()/canonical_process_start_matches()/' "$SOURCE_ROOT/tests/fixtures/herdr-process.sh")
@@ -396,11 +395,11 @@ process_start_matches() {
   canonical_process_start_matches "\$@"
 }
 SH
-  lock="$namespace/presentation-inbox.lock/owner"
-  printf 'owner_id=%s\npid=%s\nprocess_start=%s\nidentity_format=ps-lstart-c-utc-v1\nsocket_path=%s\n' \
+  owner_record="$(printf 'owner_id=%s\npid=%s\nprocess_start=%s\nidentity_format=ps-lstart-c-utc-v1\nsocket_path=%s\n' \
     "$(printf owner | base64 | tr -d '\n')" "$$" \
     "$(printf '%s' "$marker" | base64 | tr -d '\n')" \
-    "$(printf '%s' "$HPL_DEFAULT_SOCKET" | base64 | tr -d '\n')" > "$lock"
+    "$(printf '%s' "$HPL_DEFAULT_SOCKET" | base64 | tr -d '\n')")"
+  hpl_seed_presentation_inbox_lock "$namespace" "$owner_record"
   run hpl_event_run
   assert_success
   run awk '
@@ -415,52 +414,53 @@ function test_scripts_1214_herdr_pane_labels_reclaims_claims_by_the_v1_contract(
   _bats_test_init 1214 'herdr-pane-labels reclaims claim locks by the shared v1 contract'
   command -v jq >/dev/null || skip "jq not available"
   hpl_setup
-  local namespace lock marker owner
+  local namespace lock marker owner owner_record
   namespace="$(hpl_namespace "$HPL_DEFAULT_SOCKET")"
   HERDR_PANE_LABELS_TEST_NO_PRESENTATION=1 hpl_event_run
   marker="$(source "$SOURCE_ROOT/tests/fixtures/herdr-process.sh"; process_start_marker "$$")"
 
   lock="$namespace/presentation-inbox.lock"
-  mkdir "$lock"
   owner="$lock/owner"
-  printf 'owner_id=%s\npid=%s\nprocess_start=%s\nidentity_format=ps-lstart-c-utc-v1\nsocket_path=%s\n' \
+  owner_record="$(printf 'owner_id=%s\npid=%s\nprocess_start=%s\nidentity_format=ps-lstart-c-utc-v1\nsocket_path=%s\n' \
     "$(printf owner | base64 | tr -d '\n')" "$$" \
     "$(printf '%s' "$marker" | base64 | tr -d '\n')" \
-    "$(printf '%s' "$HPL_DEFAULT_SOCKET" | base64 | tr -d '\n')" > "$owner"
+    "$(printf '%s' "$HPL_DEFAULT_SOCKET" | base64 | tr -d '\n')")"
+  hpl_seed_presentation_inbox_lock "$namespace" "$owner_record"
   run hpl_event_run
   assert_success
   assert_dir_exists "$lock"
 
   rm -f "$owner"
   rmdir "$lock"
-  mkdir "$lock"
   owner="$lock/owner"
-  printf 'owner_id=%s\npid=%s\nprocess_start=%s\nidentity_format=ps-lstart-c-utc-v1\nsocket_path=%s\n' \
+  owner_record="$(printf 'owner_id=%s\npid=%s\nprocess_start=%s\nidentity_format=ps-lstart-c-utc-v1\nsocket_path=%s\n' \
     "$(printf owner | base64 | tr -d '\n')" "$$" \
     "$(printf 'Thu Jan 1 00:00:00 1970' | base64 | tr -d '\n')" \
-    "$(printf '%s' "$HPL_DEFAULT_SOCKET" | base64 | tr -d '\n')" > "$owner"
+    "$(printf '%s' "$HPL_DEFAULT_SOCKET" | base64 | tr -d '\n')")"
+  hpl_seed_presentation_inbox_lock "$namespace" "$owner_record"
   run hpl_event_run
   assert_success
   assert_dir_not_exists "$lock"
+  hpl_wait_for_presentation_quiescence "$HPL_DEFAULT_SOCKET"
 
-  mkdir "$lock"
   owner="$lock/owner"
-  printf 'owner_id=%s\npid=%s\nprocess_start=%s\nsocket_path=%s\n' \
+  owner_record="$(printf 'owner_id=%s\npid=%s\nprocess_start=%s\nsocket_path=%s\n' \
     "$(printf owner | base64 | tr -d '\n')" "$$" \
     "$(printf '%s' "$marker" | base64 | tr -d '\n')" \
-    "$(printf '%s' "$HPL_DEFAULT_SOCKET" | base64 | tr -d '\n')" > "$owner"
+    "$(printf '%s' "$HPL_DEFAULT_SOCKET" | base64 | tr -d '\n')")"
+  hpl_seed_presentation_inbox_lock "$namespace" "$owner_record"
   run hpl_event_run
   assert_success
   assert_dir_exists "$lock"
 
   rm -f "$owner"
   rmdir "$lock"
-  mkdir "$lock"
   owner="$lock/owner"
-  printf 'owner_id=%s\npid=999999\nprocess_start=%s\nidentity_format=ps-lstart-c-utc-v1\nsocket_path=%s\n' \
+  owner_record="$(printf 'owner_id=%s\npid=999999\nprocess_start=%s\nidentity_format=ps-lstart-c-utc-v1\nsocket_path=%s\n' \
     "$(printf owner | base64 | tr -d '\n')" \
     "$(printf '%s' "$marker" | base64 | tr -d '\n')" \
-    "$(printf '%s' "$HPL_DEFAULT_SOCKET" | base64 | tr -d '\n')" > "$owner"
+    "$(printf '%s' "$HPL_DEFAULT_SOCKET" | base64 | tr -d '\n')")"
+  hpl_seed_presentation_inbox_lock "$namespace" "$owner_record"
   run hpl_event_run
   assert_success
   assert_dir_not_exists "$lock"
@@ -2148,14 +2148,13 @@ function test_scripts_1164_herdr_pane_labels_event_requests_reconciliation_and_e
 
   HERDR_PANE_LABELS_TEST_NO_PRESENTATION=1 hpl_event_run
   pending="$(hpl_record_number "$reconcile" pending_generation)"
-  mkdir "$namespace/presentation-inbox.lock"
   owner="event-test-owner"
   start="$(ps -p "$$" -o lstart= | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
   socket_record="owner_id=$(printf '%s' "$owner" | base64 | tr -d '\n')
 pid=$$
 process_start=$(printf '%s' "$start" | base64 | tr -d '\n')
 socket_path=$(printf '%s' "$HPL_DEFAULT_SOCKET" | base64 | tr -d '\n')"
-  printf '%s\n' "$socket_record" > "$namespace/presentation-inbox.lock/owner"
+  hpl_seed_presentation_inbox_lock "$namespace" "$socket_record"
 
   export HERDR_PANE_LABELS_TEST_NO_DAEMON=
   export HERDR_PANE_LABELS_LOCK_ATTEMPTS=1

@@ -999,6 +999,17 @@ hpl_namespace() {
   printf '%s/sockets/%s\n' "$HPL_STATE" "$(hpl_key "$1")"
 }
 
+hpl_seed_presentation_inbox_lock() {
+  local namespace="$1" owner_record="$2" lock staged
+  lock="$namespace/presentation-inbox.lock"
+  staged="$(mktemp -d "$namespace/.presentation-inbox.lock.XXXXXX")" || return
+  printf '%s\n' "$owner_record" > "$staged/owner" || {
+    rm -rf "$staged"
+    return 1
+  }
+  mv "$staged" "$lock"
+}
+
 hpl_pane_state_dir() {
   printf '%s/panes/%s\n' "$(hpl_namespace "$1")" "$(hpl_key "$2")"
 }
