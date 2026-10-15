@@ -308,9 +308,7 @@ socket_path=$(encode_value "$SOCKET_PATH")"
       return 0
     fi
     recover_claim "$lock" "$attempt" || true
-    # The canonical matcher performs a ps probe on every retry. Keep the
-    # contention window bounded without adding the old memo back.
-    sleep 0
+    sleep 0.01
   done
   return 1
 }
