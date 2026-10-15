@@ -1862,7 +1862,7 @@ run_sweep_daemon() {
           rmdir "$SWEEP_LOCK_DIR" 2>/dev/null
         fi' EXIT
   trap 'exit 0' INT TERM
-  local misses=0
+  local misses=0 interval_sleep_pid
   while :; do
     # Whoever holds the pid file owns the sweep. Losing it means another daemon
     # took over, and two daemons would rename every tab twice per interval.
@@ -1875,12 +1875,28 @@ run_sweep_daemon() {
       misses=$((misses + 1))
       [ "$misses" -ge 3 ] && exit 0
     fi
-    sleep "$SWEEP_INTERVAL"
+    # Both this daemon and the 0.2.3 daemon run in their own process group.
+    # Keep the interval sleep in that group so a group TERM wakes the shell
+    # immediately instead of waiting for the foreground sleep to finish.
+    sleep "$SWEEP_INTERVAL" &
+    interval_sleep_pid=$!
+    wait "$interval_sleep_pid"
   done
 }
 
-# Called by the herdr plugin on startup and on agent-status events. A live
-# daemon makes this a no-op; a lock left behind by a killed daemon is cleared.
+signal_sweep_daemon() {
+  local pid="$1" pgid
+  pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+  if [ "$pgid" = "$pid" ]; then
+    kill -TERM -- "-$pid" 2>/dev/null
+  else
+    kill -TERM "$pid" 2>/dev/null
+  fi
+}
+
+# Called by the herdr plugin on startup and on agent-status events. A matching
+# v1 owner is kept; a recognized 0.2.3 owner is stopped and replaced; dead or
+# mismatched owners are cleared before a new daemon starts.
 ensure_sweep_daemon() {
   local self="$1" pid start format identity_status command startup_attempt=0
   [ -z "${HERDR_PANE_LABELS_TEST_NO_DAEMON:-}" ] || return 0
@@ -1913,13 +1929,20 @@ ensure_sweep_daemon() {
           *"/herdr-pane-labels --sweep-daemon"*) ;;
           *) return 0 ;;
         esac
-        kill -TERM "$pid" 2>/dev/null || return 1
-        wait_for_sweep_daemon_stop "$pid" || return 1
+        signal_sweep_daemon "$pid" || true
+        if ! wait_for_sweep_daemon_stop "$pid"; then
+          # Do not leave an upgrade without a daemon just because a legacy
+          # owner exceeded the graceful-stop wait. Only clear its own lock;
+          # another daemon may have taken ownership while we waited.
+          [ "$(cat "$SWEEP_LOCK_DIR/pid" 2>/dev/null)" = "$pid" ] || return 0
+        fi
       fi
     fi
-    rm -f "$SWEEP_LOCK_DIR/pid" "$SWEEP_LOCK_DIR/start" \
-      "$SWEEP_LOCK_DIR/identity_format" 2>/dev/null
-    rmdir "$SWEEP_LOCK_DIR" 2>/dev/null
+    if [ "$(cat "$SWEEP_LOCK_DIR/pid" 2>/dev/null)" = "$pid" ]; then
+      rm -f "$SWEEP_LOCK_DIR/pid" "$SWEEP_LOCK_DIR/start" \
+        "$SWEEP_LOCK_DIR/identity_format" 2>/dev/null
+      rmdir "$SWEEP_LOCK_DIR" 2>/dev/null
+    fi
   fi
   # herdr reaps the process group of a plugin hook once the hook exits, and a
   # plain background child shares that group — it was killed within the second.
@@ -1950,7 +1973,7 @@ stop_sweep_daemon() {
     *"/herdr-pane-labels --sweep-daemon"*) ;;
     *) return 1 ;;
   esac
-  kill -TERM "$pid" 2>/dev/null || return 1
+  signal_sweep_daemon "$pid" || return 1
   wait_for_sweep_daemon_stop "$pid"
 }
 
