@@ -17,11 +17,32 @@ script_path() {
 
 SELF="$(script_path)" || exit 0
 SCRIPT_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd -P)" || exit 0
-# The deployed library path is resolved relative to this script.
-# shellcheck disable=SC1091
-source "$SCRIPT_DIR/../lib/herdr-aliases.sh" || exit 0
-# shellcheck disable=SC1091
-source "$SCRIPT_DIR/../lib/herdr-process.sh" || exit 0
+# The alias library is package-owned. The checkout keeps it beside this script;
+# the installed shim keeps it under the package-owned library directory.
+CHECKOUT_ALIASES_LIBRARY="$SCRIPT_DIR/../lib/herdr-aliases.sh"
+if [ -f "$SCRIPT_DIR/../scripts/install-cli-shim.sh" ]; then
+  ALIASES_LIBRARY="$CHECKOUT_ALIASES_LIBRARY"
+else
+  ALIASES_LIBRARY="$HOME/.local/lib/herdr-pane-labels/herdr-aliases.sh"
+fi
+# shellcheck disable=SC1090
+source "$ALIASES_LIBRARY" || exit 1
+
+PROCESS_LIBRARY="$HOME/.local/lib/herdr-process.sh"
+unset HERDR_PROCESS_API
+process_library_error() {
+  local found="${HERDR_PROCESS_API:-}"
+  [ -n "$found" ] || found=none
+  printf 'herdr-pane-labels: herdr-process.sh API 1 required, found %s; run chezmoi apply\n' "$found" >&2
+  exit 1
+}
+
+if [ ! -f "$PROCESS_LIBRARY" ]; then
+  process_library_error
+fi
+# shellcheck disable=SC1090
+source "$PROCESS_LIBRARY" || process_library_error
+[ "${HERDR_PROCESS_API:-}" = 1 ] || process_library_error
 
 STATE_DIR="${HERDR_PANE_LABELS_STATE_DIR:-$HOME/.cache/herdr-pane-labels}"
 LOCATION_SOURCE_ID="location-sync"
@@ -121,7 +142,7 @@ case "$mode" in
     exit
     ;;
   diagnostics)
-    printf 'version=0.2.3\n'
+    printf 'version=0.3.0\n'
     printf 'state_dir=%s\n' "$STATE_DIR"
     printf 'socket=%s\n' "${SOCKET_PATH:-unset}"
     printf 'engine=%s\n' "$SELF"
@@ -237,7 +258,7 @@ max_number() {
 claim_owner_id=""
 
 recover_claim() {
-  local lock="$1" attempt="$2" owner pid start socket identity_status
+  local lock="$1" attempt="$2" owner pid start format socket identity_status
   owner="$(read_state_field "$lock/owner" owner_id)"
   if [ -z "$owner" ]; then
     [ "$attempt" -ge 3 ] || return 1
@@ -249,10 +270,11 @@ recover_claim() {
   fi
   pid="$(record_number "$lock/owner" pid)"
   start="$(read_state_field "$lock/owner" process_start)"
+  format="$(sed -n 's/^identity_format=//p' "$lock/owner" 2>/dev/null)"
   socket="$(read_state_field "$lock/owner" socket_path)"
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     if [ "$socket" = "$SOCKET_PATH" ]; then
-      process_start_matches "$pid" "$start"
+      process_start_matches "$pid" "$start" "$format"
       identity_status=$?
       [ "$identity_status" -eq 1 ] || return 1
     fi
@@ -276,6 +298,7 @@ acquire_claim() {
       owner_record="owner_id=$(encode_value "$owner")
 pid=$$
 process_start=$(encode_value "$start")
+identity_format=ps-lstart-c-utc-v1
 socket_path=$(encode_value "$SOCKET_PATH")"
       if ! atomic_write "$lock/owner" "$owner_record"; then
         rmdir "$lock" 2>/dev/null || true
@@ -1820,12 +1843,13 @@ run_sweep_daemon() {
   until start="$(process_start_marker "$$")"; do
     marker_attempt=$((marker_attempt + 1))
     if [ "$marker_attempt" -ge 3 ]; then
-      rm -f "$SWEEP_LOCK_DIR/pid" 2>/dev/null
+      rm -f "$SWEEP_LOCK_DIR/pid" "$SWEEP_LOCK_DIR/start" "$SWEEP_LOCK_DIR/identity_format" 2>/dev/null
       rmdir "$SWEEP_LOCK_DIR" 2>/dev/null
       exit 0
     fi
     sleep 0.01
   done
+  printf '%s\n' ps-lstart-c-utc-v1 > "$SWEEP_LOCK_DIR/identity_format" 2>/dev/null
   printf '%s\n' "$start" > "$SWEEP_LOCK_DIR/start" 2>/dev/null
   # Two traps, not one: a TERM handler that only cleans up would let the loop
   # carry on after it dropped its own lock, and the next hook would then start
@@ -1834,11 +1858,11 @@ run_sweep_daemon() {
   # The cleanup releases the lock only while this daemon still owns it. A
   # dying daemon that cleared its successor's lock left no daemon running.
   trap 'if [ "$(cat "$SWEEP_LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; then
-          rm -f "$SWEEP_LOCK_DIR/pid" "$SWEEP_LOCK_DIR/start"
+          rm -f "$SWEEP_LOCK_DIR/pid" "$SWEEP_LOCK_DIR/start" "$SWEEP_LOCK_DIR/identity_format"
           rmdir "$SWEEP_LOCK_DIR" 2>/dev/null
         fi' EXIT
   trap 'exit 0' INT TERM
-  local misses=0
+  local misses=0 interval_sleep_pid
   while :; do
     # Whoever holds the pid file owns the sweep. Losing it means another daemon
     # took over, and two daemons would rename every tab twice per interval.
@@ -1851,14 +1875,30 @@ run_sweep_daemon() {
       misses=$((misses + 1))
       [ "$misses" -ge 3 ] && exit 0
     fi
-    sleep "$SWEEP_INTERVAL"
+    # Both this daemon and the 0.2.3 daemon run in their own process group.
+    # Keep the interval sleep in that group so a group TERM wakes the shell
+    # immediately instead of waiting for the foreground sleep to finish.
+    sleep "$SWEEP_INTERVAL" &
+    interval_sleep_pid=$!
+    wait "$interval_sleep_pid"
   done
 }
 
-# Called by the herdr plugin on startup and on agent-status events. A live
-# daemon makes this a no-op; a lock left behind by a killed daemon is cleared.
+signal_sweep_daemon() {
+  local pid="$1" pgid
+  pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+  if [ "$pgid" = "$pid" ]; then
+    kill -TERM -- "-$pid" 2>/dev/null
+  else
+    kill -TERM "$pid" 2>/dev/null
+  fi
+}
+
+# Called by the herdr plugin on startup and on agent-status events. A matching
+# v1 owner is kept; a recognized 0.2.3 owner is stopped and replaced; dead or
+# mismatched owners are cleared before a new daemon starts.
 ensure_sweep_daemon() {
-  local self="$1" pid start identity_status startup_attempt=0
+  local self="$1" pid start format identity_status command startup_attempt=0
   [ -z "${HERDR_PANE_LABELS_TEST_NO_DAEMON:-}" ] || return 0
   if [ -d "$SWEEP_LOCK_DIR" ]; then
     while [ "$startup_attempt" -lt 100 ]; do
@@ -1876,13 +1916,33 @@ ensure_sweep_daemon() {
     done
     pid="$(cat "$SWEEP_LOCK_DIR/pid" 2>/dev/null)"
     start="$(cat "$SWEEP_LOCK_DIR/start" 2>/dev/null)"
+    format="$(cat "$SWEEP_LOCK_DIR/identity_format" 2>/dev/null)"
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      process_start_matches "$pid" "$start"
+      process_start_matches "$pid" "$start" "$format"
       identity_status=$?
-      [ "$identity_status" -eq 1 ] || return 0
+      if [ "$identity_status" -eq 0 ]; then
+        return 0
+      fi
+      if [ "$identity_status" -eq 2 ]; then
+        command="$(ps -ww -p "$pid" -o command= 2>/dev/null)"
+        case "$command" in
+          *"/herdr-pane-labels --sweep-daemon"*) ;;
+          *) return 0 ;;
+        esac
+        signal_sweep_daemon "$pid" || true
+        if ! wait_for_sweep_daemon_stop "$pid"; then
+          # Do not leave an upgrade without a daemon just because a legacy
+          # owner exceeded the graceful-stop wait. Only clear its own lock;
+          # another daemon may have taken ownership while we waited.
+          [ "$(cat "$SWEEP_LOCK_DIR/pid" 2>/dev/null)" = "$pid" ] || return 0
+        fi
+      fi
     fi
-    rm -f "$SWEEP_LOCK_DIR/pid" "$SWEEP_LOCK_DIR/start" 2>/dev/null
-    rmdir "$SWEEP_LOCK_DIR" 2>/dev/null
+    if [ "$(cat "$SWEEP_LOCK_DIR/pid" 2>/dev/null)" = "$pid" ]; then
+      rm -f "$SWEEP_LOCK_DIR/pid" "$SWEEP_LOCK_DIR/start" \
+        "$SWEEP_LOCK_DIR/identity_format" 2>/dev/null
+      rmdir "$SWEEP_LOCK_DIR" 2>/dev/null
+    fi
   fi
   # herdr reaps the process group of a plugin hook once the hook exits, and a
   # plain background child shares that group — it was killed within the second.
@@ -1894,26 +1954,42 @@ ensure_sweep_daemon() {
 }
 
 stop_sweep_daemon() {
-  local pid start current_start command attempts=0
+  local pid start format command identity_status
   [ -n "$SOCKET_PATH" ] || return 0
   [ -d "$SWEEP_LOCK_DIR" ] || return 0
   pid="$(cat "$SWEEP_LOCK_DIR/pid" 2>/dev/null)"
   start="$(cat "$SWEEP_LOCK_DIR/start" 2>/dev/null)"
+  format="$(cat "$SWEEP_LOCK_DIR/identity_format" 2>/dev/null)"
   case "$pid" in '' | *[!0-9]*) return 0 ;; esac
   kill -0 "$pid" 2>/dev/null || return 0
-  current_start="$(process_start_marker "$pid")" || return 1
-  [ "$current_start" = "$start" ] || return 1
+  process_start_matches "$pid" "$start" "$format"
+  identity_status=$?
+  case "$identity_status" in
+    0 | 2) ;;
+    *) return 1 ;;
+  esac
   command="$(ps -ww -p "$pid" -o command= 2>/dev/null)"
   case "$command" in
     *"/herdr-pane-labels --sweep-daemon"*) ;;
     *) return 1 ;;
   esac
-  kill -TERM "$pid" 2>/dev/null || return 1
+  signal_sweep_daemon "$pid" || return 1
+  wait_for_sweep_daemon_stop "$pid"
+}
+
+wait_for_sweep_daemon_stop() {
+  local pid="$1" attempts=0
   while kill -0 "$pid" 2>/dev/null; do
     attempts=$((attempts + 1))
     [ "$attempts" -lt 100 ] || return 1
     sleep 0.01
   done
+  [ -d "$SWEEP_LOCK_DIR" ] || return 0
+  [ "$(cat "$SWEEP_LOCK_DIR/pid" 2>/dev/null)" = "$pid" ] || return 1
+  rm -f "$SWEEP_LOCK_DIR/pid" "$SWEEP_LOCK_DIR/start" \
+    "$SWEEP_LOCK_DIR/identity_format" 2>/dev/null
+  rmdir "$SWEEP_LOCK_DIR" 2>/dev/null
+  [ ! -d "$SWEEP_LOCK_DIR" ]
 }
 
 case "$mode" in
@@ -1938,7 +2014,7 @@ case "$mode" in
     fi
     initialize_namespace || exit 0
     SWEEP_LOCK_DIR="$(namespace_dir)/sweep.lock"
-    stop_sweep_daemon
+    stop_sweep_daemon || exit 1
     ;;
   event)
     if request_presentation; then start_presentation_coordinator || true; fi

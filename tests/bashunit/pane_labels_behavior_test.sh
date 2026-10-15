@@ -348,17 +348,191 @@ function test_scripts_1111_herdr_pane_labels_rejects_unsafe_snapshot_strings_bef
   done
 }
 
-function test_scripts_1112_herdr_pane_labels_sources_the_alias_library_relative_to() {
-  _bats_test_init 1112 'herdr-pane-labels sources the alias library relative to its deployed path'
-  local deployed="$BATS_TEST_TMPDIR/deployed-herdr-pane-labels"
-  mkdir -p "$deployed/bin" "$deployed/lib"
-  cp "$HPL_ENGINE" "$deployed/bin/herdr-pane-labels"
-  cp "$HERDR_ALIASES" "$deployed/lib/herdr-aliases.sh"
-  cp "$SOURCE_ROOT/lib/herdr-process.sh" "$deployed/lib/herdr-process.sh"
+function test_scripts_1112_herdr_pane_labels_installed_shim_uses_the_installer_lay() {
+  _bats_test_init 1112 'herdr-pane-labels installed shim uses the installer layout'
+  hpl_setup
 
-  run env PATH="$deployed/bin:/usr/bin:/bin" bash "$deployed/bin/herdr-pane-labels" --help
+  run env HOME="$HPL_HOME" "$SOURCE_ROOT/scripts/install-cli-shim.sh"
+  assert_success
+  run env HOME="$HPL_HOME" PATH="$HPL_HOME/.local/bin:/usr/bin:/bin" herdr-pane-labels --help
   assert_success
   assert_output --partial 'Usage: herdr-pane-labels'
+}
+
+function test_scripts_1209_herdr_pane_labels_claim_owners_use_the_shared_v1_ident() {
+  _bats_test_init 1209 'herdr-pane-labels claim owners use the shared v1 identity format'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local pause="$HPL_WORK/claim-owner" claim worker_pid marker format
+  pause="$HPL_WORK/claim-owner"
+  HERDR_PANE_LABELS_TEST_NO_PRESENTATION='' HERDR_PANE_LABELS_TEST_PAUSE_BEFORE_RELEASE="$pause" hpl_event_run
+  hpl_wait_for_file "$pause.reached"
+  claim="$(hpl_namespace "$HPL_DEFAULT_SOCKET")/presentation.claim/owner"
+  worker_pid="$(hpl_record_number "$claim" pid)"
+  marker="$(sed -n 's/^process_start=//p' "$claim" | base64 -d)"
+  format="$(sed -n 's/^identity_format=//p' "$claim")"
+  assert_equal "$format" ps-lstart-c-utc-v1
+  # shellcheck source=/dev/null
+  source "$SOURCE_ROOT/tests/fixtures/herdr-process.sh"
+  run process_start_matches "$worker_pid" "$marker" "$format"
+  assert_success
+  : > "$pause.release"
+  hpl_wait_for_presentation_quiescence "$HPL_DEFAULT_SOCKET"
+}
+
+function test_scripts_1210_herdr_pane_labels_calls_the_shared_matcher_with_v1_forma() {
+  _bats_test_init 1210 'herdr-pane-labels calls the shared matcher with the v1 format'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local namespace marker owner_record calls="$HPL_WORK/process-matcher.calls"
+  namespace="$(hpl_namespace "$HPL_DEFAULT_SOCKET")"
+  HERDR_PANE_LABELS_TEST_NO_PRESENTATION=1 hpl_event_run
+  marker="$(source "$SOURCE_ROOT/tests/fixtures/herdr-process.sh"; process_start_marker "$$")"
+  cat > "$HPL_HOME/.local/lib/herdr-process.sh" <<SH
+$(sed 's/^process_start_matches()/canonical_process_start_matches()/' "$SOURCE_ROOT/tests/fixtures/herdr-process.sh")
+process_start_matches() {
+  printf '%s\t%s\n' "\$#" "\${3:-}" >> "$calls"
+  canonical_process_start_matches "\$@"
+}
+SH
+  owner_record="$(printf 'owner_id=%s\npid=%s\nprocess_start=%s\nidentity_format=ps-lstart-c-utc-v1\nsocket_path=%s\n' \
+    "$(printf owner | base64 | tr -d '\n')" "$$" \
+    "$(printf '%s' "$marker" | base64 | tr -d '\n')" \
+    "$(printf '%s' "$HPL_DEFAULT_SOCKET" | base64 | tr -d '\n')")"
+  hpl_seed_presentation_inbox_lock "$namespace" "$owner_record"
+  run hpl_event_run
+  assert_success
+  run hpl_matcher_calls_are_v1 "$calls"
+  assert_success
+  printf '3\tps-lstart-c-utc-v1\n2\t\n' > "$HPL_WORK/process-matcher.invalid.calls"
+  run hpl_matcher_calls_are_v1 "$HPL_WORK/process-matcher.invalid.calls"
+  assert_failure
+}
+
+function test_scripts_1214_herdr_pane_labels_reclaims_claims_by_the_v1_contract() {
+  _bats_test_init 1214 'herdr-pane-labels reclaims claim locks by the shared v1 contract'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local namespace lock marker owner owner_record
+  namespace="$(hpl_namespace "$HPL_DEFAULT_SOCKET")"
+  HERDR_PANE_LABELS_TEST_NO_PRESENTATION=1 hpl_event_run
+  marker="$(source "$SOURCE_ROOT/tests/fixtures/herdr-process.sh"; process_start_marker "$$")"
+
+  lock="$namespace/presentation-inbox.lock"
+  owner="$lock/owner"
+  owner_record="$(printf 'owner_id=%s\npid=%s\nprocess_start=%s\nidentity_format=ps-lstart-c-utc-v1\nsocket_path=%s\n' \
+    "$(printf owner | base64 | tr -d '\n')" "$$" \
+    "$(printf '%s' "$marker" | base64 | tr -d '\n')" \
+    "$(printf '%s' "$HPL_DEFAULT_SOCKET" | base64 | tr -d '\n')")"
+  hpl_seed_presentation_inbox_lock "$namespace" "$owner_record"
+  run hpl_event_run
+  assert_success
+  assert_dir_exists "$lock"
+
+  rm -f "$owner"
+  rmdir "$lock"
+  owner="$lock/owner"
+  owner_record="$(printf 'owner_id=%s\npid=%s\nprocess_start=%s\nidentity_format=ps-lstart-c-utc-v1\nsocket_path=%s\n' \
+    "$(printf owner | base64 | tr -d '\n')" "$$" \
+    "$(printf 'Thu Jan 1 00:00:00 1970' | base64 | tr -d '\n')" \
+    "$(printf '%s' "$HPL_DEFAULT_SOCKET" | base64 | tr -d '\n')")"
+  hpl_seed_presentation_inbox_lock "$namespace" "$owner_record"
+  run hpl_event_run
+  assert_success
+  assert_dir_not_exists "$lock"
+  hpl_wait_for_presentation_quiescence "$HPL_DEFAULT_SOCKET"
+
+  owner="$lock/owner"
+  owner_record="$(printf 'owner_id=%s\npid=%s\nprocess_start=%s\nsocket_path=%s\n' \
+    "$(printf owner | base64 | tr -d '\n')" "$$" \
+    "$(printf 'Thu Jan 1 00:00:00 1970' | base64 | tr -d '\n')" \
+    "$(printf '%s' "$HPL_DEFAULT_SOCKET" | base64 | tr -d '\n')")"
+  hpl_seed_presentation_inbox_lock "$namespace" "$owner_record"
+  run hpl_event_run
+  assert_success
+  assert_dir_exists "$lock"
+
+  rm -f "$owner"
+  rmdir "$lock"
+  owner="$lock/owner"
+  owner_record="$(printf 'owner_id=%s\npid=999999\nprocess_start=%s\nidentity_format=ps-lstart-c-utc-v1\nsocket_path=%s\n' \
+    "$(printf owner | base64 | tr -d '\n')" \
+    "$(printf '%s' "$marker" | base64 | tr -d '\n')" \
+    "$(printf '%s' "$HPL_DEFAULT_SOCKET" | base64 | tr -d '\n')")"
+  hpl_seed_presentation_inbox_lock "$namespace" "$owner_record"
+  run hpl_event_run
+  assert_success
+  assert_dir_not_exists "$lock"
+}
+
+function test_scripts_1211_herdr_pane_labels_rejects_a_missing_shared_process_libr() {
+  _bats_test_init 1211 'herdr-pane-labels rejects every mode without the shared process library'
+  hpl_setup
+  rm "$HPL_HOME/.local/lib/herdr-process.sh"
+  local mode expected='herdr-pane-labels: herdr-process.sh API 1 required, found none; run chezmoi apply'
+  for mode in --help '--alias-candidates test' --diagnostics --sweep --event; do
+    # shellcheck disable=SC2086
+    run --separate-stderr env HOME="$HPL_HOME" PATH="$HPL_STUB:/usr/bin:/bin" \
+      HERDR_PANE_LABELS_TEST_NO_DAEMON=1 bash "$HPL_ENGINE" $mode
+    assert_failure
+    assert_stderr "$expected"
+  done
+  run env HOME="$HPL_HOME" "$SOURCE_ROOT/scripts/install-cli-shim.sh"
+  assert_success
+  assert_file_not_exists "$HPL_HOME/.local/lib/herdr-process.sh"
+  run --separate-stderr env HOME="$HPL_HOME" "$HPL_HOME/.local/bin/herdr-pane-labels" --help
+  assert_failure
+  assert_stderr "$expected"
+}
+
+function test_scripts_1212_herdr_pane_labels_rejects_an_incompatible_shared_process() {
+  _bats_test_init 1212 'herdr-pane-labels rejects every mode with an incompatible shared process API'
+  hpl_setup
+  sed 's/^HERDR_PROCESS_API=1$/HERDR_PROCESS_API=2/' \
+    "$SOURCE_ROOT/tests/fixtures/herdr-process.sh" > "$HPL_HOME/.local/lib/herdr-process.sh"
+  local mode expected='herdr-pane-labels: herdr-process.sh API 1 required, found 2; run chezmoi apply'
+  for mode in --help '--alias-candidates test' --diagnostics --sweep --event; do
+    # shellcheck disable=SC2086
+    run --separate-stderr env HOME="$HPL_HOME" PATH="$HPL_STUB:/usr/bin:/bin" \
+      HERDR_PANE_LABELS_TEST_NO_DAEMON=1 bash "$HPL_ENGINE" $mode
+    assert_failure
+    assert_stderr "$expected"
+  done
+  run env HOME="$HPL_HOME" "$SOURCE_ROOT/scripts/install-cli-shim.sh"
+  assert_success
+  sed 's/^HERDR_PROCESS_API=1$/HERDR_PROCESS_API=2/' \
+    "$SOURCE_ROOT/tests/fixtures/herdr-process.sh" > "$HPL_HOME/.local/lib/herdr-process.sh"
+  run --separate-stderr env HOME="$HPL_HOME" "$HPL_HOME/.local/bin/herdr-pane-labels" --help
+  assert_failure
+  assert_stderr "$expected"
+}
+
+function test_scripts_1213_herdr_pane_labels_hooks_notify_for_a_shared_process_erro() {
+  _bats_test_init 1213 'herdr-pane-labels hooks notify when the shared process library is unavailable'
+  hpl_setup
+  local expected='herdr-pane-labels: herdr-process.sh API 1 required, found none; run chezmoi apply'
+  rm "$HPL_HOME/.local/lib/herdr-process.sh"
+  run env HOME="$HPL_HOME" PATH="$HPL_STUB:/usr/bin:/bin" \
+    HERDR_PANE_LABELS_TEST_NO_DAEMON=1 sh "$SOURCE_ROOT/bin/ensure.sh"
+  assert_success
+  assert_file_contains "$HPL_LOG" "^notification show .*run chezmoi apply"
+  assert_file_contains "$HPL_LOG" "$expected"
+
+  : > "$HPL_LOG"
+  sed 's/^HERDR_PROCESS_API=1$/HERDR_PROCESS_API=2/' \
+    "$SOURCE_ROOT/tests/fixtures/herdr-process.sh" > "$HPL_HOME/.local/lib/herdr-process.sh"
+  run env HOME="$HPL_HOME" PATH="$HPL_STUB:/usr/bin:/bin" \
+    HERDR_PANE_LABELS_TEST_NO_DAEMON=1 sh "$SOURCE_ROOT/bin/ensure.sh" --event
+  assert_success
+  assert_file_contains "$HPL_LOG" "^notification show .*found 2.*run chezmoi apply"
+
+  : > "$HPL_LOG"
+  cp "$SOURCE_ROOT/tests/fixtures/herdr-process.sh" "$HPL_HOME/.local/lib/herdr-process.sh"
+  run env HOME="$HPL_HOME" PATH="$HPL_STUB:/usr/bin:/bin" \
+    HERDR_PANE_LABELS_TEST_NO_DAEMON=1 sh "$SOURCE_ROOT/bin/ensure.sh" --event
+  assert_success
+  run grep '^notification show' "$HPL_LOG"
+  assert_failure
 }
 
 function test_scripts_1114_herdr_pane_labels_retries_only_an_exact_confirmed_agent() {
@@ -566,9 +740,10 @@ function test_scripts_1118_herdr_pane_labels_rejects_a_complete_stale_post_renam
 
 function test_scripts_1119_herdr_pane_labels_contains_no_semantic_naming_or_retire() {
   _bats_test_init 1119 'herdr-pane-labels contains no semantic naming or retired worker interface'
+  hpl_setup
   local retired
   for retired in --agent --session --transcript --set --worker; do
-    run bash "$HPL_ENGINE" "$retired"
+    run env HOME="$HPL_HOME" bash "$HPL_ENGINE" "$retired"
     assert_failure 2
     assert_output --partial 'Usage: herdr-pane-labels'
   done
@@ -855,9 +1030,9 @@ function test_scripts_1131_herdr_pane_labels_presentation_fails_closed_without_a
   hpl_set_pane "$HPL_DEFAULT_SOCKET" '{"pane_id":"pane-1","tab_id":"tab-1","workspace_id":"ws-1","terminal_id":"term-1","agent":null,"label":"unchanged","tokens":{}}'
   hpl_set_tab "$HPL_DEFAULT_SOCKET" '{"tab_id":"tab-1","workspace_id":"ws-1","label":"unchanged"}'
   hpl_proc_info pane-1 '{"result":{"process_info":{"shell_pid":1,"foreground_process_group_id":2,"foreground_processes":[{"pid":2,"argv":["changed"]}]}}}'
-  run env -u HERDR_SOCKET_PATH PATH="$HPL_STUB:/usr/bin:/bin" HERDR_PANE_LABELS_STATE_DIR="$HPL_STATE" bash "$HPL_ENGINE" --event
+  run env -u HERDR_SOCKET_PATH HOME="$HPL_HOME" PATH="$HPL_STUB:/usr/bin:/bin" HERDR_PANE_LABELS_STATE_DIR="$HPL_STATE" bash "$HPL_ENGINE" --event
   assert_success
-  run env -u HERDR_SOCKET_PATH PATH="$HPL_STUB:/usr/bin:/bin" HERDR_PANE_LABELS_STATE_DIR="$HPL_STATE" bash "$HPL_ENGINE" --sweep
+  run env -u HERDR_SOCKET_PATH HOME="$HPL_HOME" PATH="$HPL_STUB:/usr/bin:/bin" HERDR_PANE_LABELS_STATE_DIR="$HPL_STATE" bash "$HPL_ENGINE" --sweep
   assert_success
   assert_equal "$(cat "$HPL_LOG")" ""
   assert_equal "$(jq -r '.panes[0].label' "$(hpl_socket_state "$HPL_DEFAULT_SOCKET")")" unchanged
@@ -1883,6 +2058,7 @@ function test_scripts_1208_herdr_pane_labels_icon_constants_stay_independent_of_
   # tree whose engine declares a different ICON_BRANCH: a derived constant
   # follows the mutation, a pinned one does not. Rewriting the whole assignment
   # keeps this test independent of whichever codepoint ICON_BRANCH holds today.
+  hpl_setup
   local root="$BATS_TEST_TMPDIR/mutated-engine" harness
   harness="$BATS_TEST_DIRNAME/helpers/herdr_pane_labels.bash"
   mkdir -p "$root/bin"
@@ -1892,7 +2068,7 @@ function test_scripts_1208_herdr_pane_labels_icon_constants_stay_independent_of_
   assert_file_contains "$root/bin/herdr-pane-labels" \
     'ICON_BRANCH=.*\\342\\234\\224'
 
-  run env SOURCE_ROOT="$root" bash -c 'source "$1"; printf %s "$HPL_ICON_BRANCH"' _ "$harness"
+  run env HOME="$HPL_HOME" SOURCE_ROOT="$root" bash -c 'source "$1"; printf %s "$HPL_ICON_BRANCH"' _ "$harness"
   assert_success
   assert_output "$HPL_ICON_BRANCH"
 }
@@ -1926,6 +2102,7 @@ function test_scripts_1162_herdr_pane_labels_plugin_exposes_only_the_approved_pa
 
 function test_scripts_1163_herdr_pane_labels_plugin_wrappers_invoke_one_engine_mod() {
   _bats_test_init 1163 'herdr-pane-labels plugin wrappers invoke one engine mode and isolate failures'
+  hpl_setup
   local package="$BATS_TEST_TMPDIR/package" engine_log="$BATS_TEST_TMPDIR/plugin-engine.log"
   mkdir -p "$package/bin"
   cp "$HPL_PLUGIN_DIR/bin/ensure.sh" "$package/bin/ensure.sh"
@@ -1940,17 +2117,17 @@ exit 0
 SH
   chmod +x "$package/bin/herdr-pane-labels"
 
-  run env HOME="$BATS_TEST_TMPDIR/home" HERDR_SOCKET_PATH=/tmp/u5.sock \
+  run env HOME="$HPL_HOME" HERDR_SOCKET_PATH=/tmp/u5.sock \
     HPL_PLUGIN_ENGINE_LOG="$engine_log" HPL_PLUGIN_CASE=startup \
     HPL_PLUGIN_FAIL_ARG=--ensure-sweep-daemon sh "$package/bin/ensure.sh"
   assert_success
   assert_output ""
-  run env HOME="$BATS_TEST_TMPDIR/home" HERDR_SOCKET_PATH=/tmp/u5.sock \
+  run env HOME="$HPL_HOME" HERDR_SOCKET_PATH=/tmp/u5.sock \
     HPL_PLUGIN_ENGINE_LOG="$engine_log" HPL_PLUGIN_CASE=event-fails \
     HPL_PLUGIN_FAIL_ARG=--event sh "$package/bin/ensure.sh" --event
   assert_success
   assert_output ""
-  run env HOME="$BATS_TEST_TMPDIR/home" HERDR_SOCKET_PATH=/tmp/u5.sock \
+  run env HOME="$HPL_HOME" HERDR_SOCKET_PATH=/tmp/u5.sock \
     HPL_PLUGIN_ENGINE_LOG="$engine_log" HPL_PLUGIN_CASE=sweep \
     HPL_PLUGIN_FAIL_ARG=--sweep sh "$package/bin/sweep.sh"
   assert_success
@@ -1970,27 +2147,310 @@ function test_scripts_1164_herdr_pane_labels_event_requests_reconciliation_and_e
 
   HERDR_PANE_LABELS_TEST_NO_PRESENTATION=1 hpl_event_run
   pending="$(hpl_record_number "$reconcile" pending_generation)"
-  mkdir "$namespace/presentation-inbox.lock"
   owner="event-test-owner"
   start="$(ps -p "$$" -o lstart= | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
   socket_record="owner_id=$(printf '%s' "$owner" | base64 | tr -d '\n')
 pid=$$
 process_start=$(printf '%s' "$start" | base64 | tr -d '\n')
 socket_path=$(printf '%s' "$HPL_DEFAULT_SOCKET" | base64 | tr -d '\n')"
-  printf '%s\n' "$socket_record" > "$namespace/presentation-inbox.lock/owner"
+  hpl_seed_presentation_inbox_lock "$namespace" "$socket_record"
 
   export HERDR_PANE_LABELS_TEST_NO_DAEMON=
   export HERDR_PANE_LABELS_LOCK_ATTEMPTS=1
   run hpl_event_run
   unset HERDR_PANE_LABELS_TEST_NO_DAEMON HERDR_PANE_LABELS_LOCK_ATTEMPTS
   assert_success
-  hpl_wait_for_file "$sweep_lock/pid"
+  hpl_wait_for_nonempty_file "$sweep_lock/pid"
+  hpl_wait_for_nonempty_file "$sweep_lock/start"
+  hpl_wait_for_nonempty_file "$sweep_lock/identity_format"
   assert_equal "$(hpl_record_number "$reconcile" pending_generation)" "$pending"
   pid="$(cat "$sweep_lock/pid")"
+  assert_equal "$(cat "$sweep_lock/identity_format")" ps-lstart-c-utc-v1
+  # shellcheck source=/dev/null
+  source "$SOURCE_ROOT/tests/fixtures/herdr-process.sh"
+  run process_start_matches "$pid" "$(cat "$sweep_lock/start")" "$(cat "$sweep_lock/identity_format")"
+  assert_success
   kill "$pid" 2>/dev/null || true
   rm -f "$namespace/presentation-inbox.lock/owner"
   rmdir "$namespace/presentation-inbox.lock"
 
+}
+
+function test_scripts_1215_herdr_pane_labels_keeps_a_matching_v1_sweep_lock() {
+  _bats_test_init 1215 'herdr-pane-labels keeps a matching v1 sweep lock'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local namespace sweep_lock marker calls
+  namespace="$(hpl_namespace "$HPL_DEFAULT_SOCKET")"
+  sweep_lock="$namespace/sweep.lock"
+  calls="$HPL_WORK/process-matcher.calls"
+  source "$SOURCE_ROOT/tests/fixtures/herdr-process.sh"
+  marker="$(process_start_marker "$$")"
+  sed 's/^process_start_matches()/canonical_process_start_matches()/' \
+    "$SOURCE_ROOT/tests/fixtures/herdr-process.sh" > "$HPL_HOME/.local/lib/herdr-process.sh"
+  cat >> "$HPL_HOME/.local/lib/herdr-process.sh" <<SH
+process_start_matches() {
+  printf '%s|%s\\n' "\$#" "\${3:-}" >> "$calls"
+  canonical_process_start_matches "\$@"
+}
+SH
+  mkdir -p "$sweep_lock"
+  printf '%s\n' "$$" > "$sweep_lock/pid"
+  printf '%s\n' "$marker" > "$sweep_lock/start"
+  printf '%s\n' ps-lstart-c-utc-v1 > "$sweep_lock/identity_format"
+
+  run hpl_sweep_run --ensure-sweep-daemon
+  assert_success
+  run test -s "$sweep_lock/pid"
+  assert_success
+  assert_equal "$(cat "$sweep_lock/pid")" "$$"
+  assert_equal "$(cat "$calls")" '3|ps-lstart-c-utc-v1'
+}
+
+function test_scripts_1216_herdr_pane_labels_reclaims_a_mismatched_v1_sweep_lock() {
+  _bats_test_init 1216 'herdr-pane-labels reclaims a mismatched v1 sweep lock'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local namespace sweep_lock calls new_pid
+  namespace="$(hpl_namespace "$HPL_DEFAULT_SOCKET")"
+  sweep_lock="$namespace/sweep.lock"
+  calls="$HPL_WORK/process-matcher.calls"
+  sed 's/^process_start_matches()/canonical_process_start_matches()/' \
+    "$SOURCE_ROOT/tests/fixtures/herdr-process.sh" > "$HPL_HOME/.local/lib/herdr-process.sh"
+  cat >> "$HPL_HOME/.local/lib/herdr-process.sh" <<SH
+process_start_matches() {
+  printf '%s|%s\\n' "\$#" "\${3:-}" >> "$calls"
+  canonical_process_start_matches "\$@"
+}
+SH
+  mkdir -p "$sweep_lock"
+  printf '%s\n' "$$" > "$sweep_lock/pid"
+  printf '%s\n' 'Thu Jan 1 00:00:00 1970' > "$sweep_lock/start"
+  printf '%s\n' ps-lstart-c-utc-v1 > "$sweep_lock/identity_format"
+
+  run hpl_sweep_run --ensure-sweep-daemon
+  assert_success
+  new_pid=""
+  for _ in $(seq 1 200); do
+    if [ -s "$sweep_lock/pid" ]; then
+      new_pid="$(cat "$sweep_lock/pid")"
+      [ "$new_pid" != "$$" ] && break
+    fi
+    sleep 0.01
+  done
+  run test -n "$new_pid"
+  assert_success
+  run test "$new_pid" != "$$"
+  assert_success
+  kill "$new_pid" 2>/dev/null || true
+  assert_equal "$(cat "$calls")" '3|ps-lstart-c-utc-v1'
+}
+
+function test_scripts_1217_herdr_pane_labels_keeps_a_formatless_live_sweep_lock() {
+  _bats_test_init 1217 'herdr-pane-labels keeps a formatless live sweep lock'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local namespace sweep_lock marker calls
+  namespace="$(hpl_namespace "$HPL_DEFAULT_SOCKET")"
+  sweep_lock="$namespace/sweep.lock"
+  calls="$HPL_WORK/process-matcher.calls"
+  source "$SOURCE_ROOT/tests/fixtures/herdr-process.sh"
+  marker="$(process_start_marker "$$")"
+  sed 's/^process_start_matches()/canonical_process_start_matches()/' \
+    "$SOURCE_ROOT/tests/fixtures/herdr-process.sh" > "$HPL_HOME/.local/lib/herdr-process.sh"
+  cat >> "$HPL_HOME/.local/lib/herdr-process.sh" <<SH
+process_start_matches() {
+  printf '%s|%s\\n' "\$#" "\${3:-}" >> "$calls"
+  canonical_process_start_matches "\$@"
+}
+SH
+  mkdir -p "$sweep_lock"
+  printf '%s\n' "$$" > "$sweep_lock/pid"
+  printf '%s\n' "$marker" > "$sweep_lock/start"
+
+  run hpl_sweep_run --ensure-sweep-daemon
+  assert_success
+  run test -s "$sweep_lock/pid"
+  assert_success
+  assert_equal "$(cat "$sweep_lock/pid")" "$$"
+  assert_equal "$(cat "$calls")" '3|'
+  run hpl_sweep_run --stop
+  assert_failure
+  assert_equal "$(cat "$sweep_lock/pid")" "$$"
+}
+
+function test_scripts_1218_herdr_pane_labels_reclaims_a_dead_v1_sweep_lock() {
+  _bats_test_init 1218 'herdr-pane-labels reclaims a dead v1 sweep lock'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local namespace sweep_lock new_pid format
+  namespace="$(hpl_namespace "$HPL_DEFAULT_SOCKET")"
+  sweep_lock="$namespace/sweep.lock"
+  mkdir -p "$sweep_lock"
+  printf '%s\n' 999999 > "$sweep_lock/pid"
+  printf '%s\n' 'Thu Jan 1 00:00:00 1970' > "$sweep_lock/start"
+  printf '%s\n' ps-lstart-c-utc-v1 > "$sweep_lock/identity_format"
+
+  run hpl_sweep_run --ensure-sweep-daemon
+  assert_success
+  new_pid=""
+  for _ in $(seq 1 200); do
+    if [ -s "$sweep_lock/pid" ] && [ -s "$sweep_lock/start" ] && [ -s "$sweep_lock/identity_format" ]; then
+      new_pid="$(cat "$sweep_lock/pid")"
+      [ "$new_pid" != 999999 ] && break
+    fi
+    sleep 0.01
+  done
+  run test -n "$new_pid"
+  assert_success
+  run test "$new_pid" != 999999
+  assert_success
+  format="$(cat "$sweep_lock/identity_format" 2>/dev/null || true)"
+  kill "$new_pid" 2>/dev/null || true
+  assert_equal "$format" ps-lstart-c-utc-v1
+}
+
+function test_scripts_1219_herdr_pane_labels_stop_stops_a_formatless_legacy_daemon() {
+  _bats_test_init 1219 'herdr-pane-labels --stop stops a formatless legacy sweep daemon'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local namespace sweep_lock legacy_pid interval_sleep_pid
+  namespace="$(hpl_namespace "$HPL_DEFAULT_SOCKET")"
+  sweep_lock="$namespace/sweep.lock"
+  hpl_start_legacy_sweep_daemon legacy_pid
+  run hpl_wait_for_interval_sleep "$legacy_pid"
+  assert_success
+  # shellcheck disable=SC2154
+  interval_sleep_pid="$output"
+  mkdir -p "$sweep_lock"
+  printf '%s\n' "$legacy_pid" > "$sweep_lock/pid"
+  printf '%s\n' 'Thu Jan 1 00:00:00 1970' > "$sweep_lock/start"
+
+  run hpl_sweep_run --stop
+  assert_success
+  run kill -0 "$legacy_pid"
+  assert_failure
+  run kill -0 "$interval_sleep_pid"
+  assert_failure
+  assert_dir_not_exists "$sweep_lock"
+}
+
+function test_scripts_1220_herdr_pane_labels_ensure_replaces_a_formatless_legacy_da() {
+  _bats_test_init 1220 'herdr-pane-labels --ensure-sweep-daemon replaces a formatless legacy daemon'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local namespace sweep_lock legacy_pid interval_sleep_pid new_pid="" _
+  namespace="$(hpl_namespace "$HPL_DEFAULT_SOCKET")"
+  sweep_lock="$namespace/sweep.lock"
+  hpl_start_legacy_sweep_daemon legacy_pid
+  run hpl_wait_for_interval_sleep "$legacy_pid"
+  assert_success
+  # shellcheck disable=SC2154
+  interval_sleep_pid="$output"
+  mkdir -p "$sweep_lock"
+  printf '%s\n' "$legacy_pid" > "$sweep_lock/pid"
+  printf '%s\n' 'Thu Jan 1 00:00:00 1970' > "$sweep_lock/start"
+
+  run hpl_sweep_run --ensure-sweep-daemon
+  assert_success
+  for _ in $(seq 1 200); do
+    if [ -s "$sweep_lock/pid" ] && [ -s "$sweep_lock/start" ] && [ -s "$sweep_lock/identity_format" ]; then
+      new_pid="$(cat "$sweep_lock/pid")"
+      [ "$new_pid" != "$legacy_pid" ] && break
+    fi
+    sleep 0.01
+  done
+  run test -n "$new_pid"
+  assert_success
+  hpl_track_background_process "$new_pid"
+  assert_equal "$(cat "$sweep_lock/identity_format")" ps-lstart-c-utc-v1
+  run kill -0 "$legacy_pid"
+  assert_failure
+  run kill -0 "$interval_sleep_pid"
+  assert_failure
+}
+
+function test_scripts_1223_herdr_pane_labels_stop_stops_a_v1_daemon_during_its_inte() {
+  _bats_test_init 1223 'herdr-pane-labels --stop stops a v1 sweep daemon during its interval sleep'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local namespace sweep_lock daemon_pid="" interval_sleep_pid _
+  namespace="$(hpl_namespace "$HPL_DEFAULT_SOCKET")"
+  sweep_lock="$namespace/sweep.lock"
+
+  HPL_SWEEP_INTERVAL=3 hpl_sweep_run --ensure-sweep-daemon
+  assert_success
+  for _ in $(seq 1 200); do
+    if [ -s "$sweep_lock/pid" ] && [ -s "$sweep_lock/start" ] && [ -s "$sweep_lock/identity_format" ]; then
+      daemon_pid="$(cat "$sweep_lock/pid")"
+      break
+    fi
+    sleep 0.01
+  done
+  run test -n "$daemon_pid"
+  assert_success
+  hpl_track_background_process "$daemon_pid"
+  run hpl_wait_for_interval_sleep "$daemon_pid"
+  assert_success
+  # shellcheck disable=SC2154
+  interval_sleep_pid="$output"
+
+  HPL_SWEEP_INTERVAL=3 run hpl_sweep_run --stop
+  assert_success
+  run kill -0 "$daemon_pid"
+  assert_failure
+  run kill -0 "$interval_sleep_pid"
+  assert_failure
+  assert_dir_not_exists "$sweep_lock"
+}
+
+function test_scripts_1221_herdr_pane_labels_stop_checks_a_matching_v1_daemon() {
+  _bats_test_init 1221 'herdr-pane-labels --stop checks and stops a matching v1 daemon'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local namespace sweep_lock legacy_pid marker calls="$HPL_WORK/process-matcher.calls"
+  namespace="$(hpl_namespace "$HPL_DEFAULT_SOCKET")"
+  sweep_lock="$namespace/sweep.lock"
+  hpl_start_legacy_sweep_daemon legacy_pid
+  marker="$(source "$SOURCE_ROOT/tests/fixtures/herdr-process.sh"; process_start_marker "$legacy_pid")"
+  sed 's/^process_start_matches()/canonical_process_start_matches()/' \
+    "$SOURCE_ROOT/tests/fixtures/herdr-process.sh" > "$HPL_HOME/.local/lib/herdr-process.sh"
+  cat >> "$HPL_HOME/.local/lib/herdr-process.sh" <<SH
+process_start_matches() {
+  printf '%s|%s\\n' "\$#" "\${3:-}" >> "$calls"
+  canonical_process_start_matches "\$@"
+}
+SH
+  mkdir -p "$sweep_lock"
+  printf '%s\n' "$legacy_pid" > "$sweep_lock/pid"
+  printf '%s\n' "$marker" > "$sweep_lock/start"
+  printf '%s\n' ps-lstart-c-utc-v1 > "$sweep_lock/identity_format"
+
+  run hpl_sweep_run --stop
+  assert_success
+  run kill -0 "$legacy_pid"
+  assert_failure
+  assert_equal "$(cat "$calls")" '3|ps-lstart-c-utc-v1'
+}
+
+function test_scripts_1222_herdr_pane_labels_stop_keeps_a_mismatched_v1_daemon() {
+  _bats_test_init 1222 'herdr-pane-labels --stop keeps a mismatched v1 daemon'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local namespace sweep_lock legacy_pid
+  namespace="$(hpl_namespace "$HPL_DEFAULT_SOCKET")"
+  sweep_lock="$namespace/sweep.lock"
+  hpl_start_legacy_sweep_daemon legacy_pid
+  mkdir -p "$sweep_lock"
+  printf '%s\n' "$legacy_pid" > "$sweep_lock/pid"
+  printf '%s\n' 'Thu Jan 1 00:00:00 1970' > "$sweep_lock/start"
+  printf '%s\n' ps-lstart-c-utc-v1 > "$sweep_lock/identity_format"
+
+  run hpl_sweep_run --stop
+  assert_failure
+  run kill -0 "$legacy_pid"
+  assert_success
+  assert_dir_exists "$sweep_lock"
 }
 
 function test_scripts_1165_herdr_pane_labels_sweep_repairs_an_external_pane_rename() {
