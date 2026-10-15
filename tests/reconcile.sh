@@ -69,7 +69,7 @@ test_complete_snapshot_and_conflict_retry() {
     "$ENGINE" --sweep; then
     fail 'complete snapshot reconciles successfully'
   fi
-  grep -q 'pane rename pane-1 cc:red-wolf' "$WORK/writes" || \
+  grep -q 'pane rename pane-1  red-wolf' "$WORK/writes" || \
     fail 'pane label follows the complete snapshot'
   pass 'complete snapshot reconciles safely'
 }

@@ -373,19 +373,24 @@ retained_location=$(encode_value "$retained_location")"
   atomic_write "$file" "$content"
 }
 
-# A pane label opens with a short agent prefix, so several labels still fit
-# in the tab label. Plain ASCII on purpose: the earlier Nerd Font glyph badges
-# rendered as empty boxes on any terminal without a patched font. An agent
-# with no prefix of its own falls back to its first letter.
+# A pane label opens with a one-cell agent icon, so several labels still fit
+# in the tab label. The icons are Nerd Font glyphs and need a patched font in
+# every terminal that shows herdr. They are written as UTF-8 byte escapes
+# because Private Use Area characters get lost when source text is copied.
+# An agent with no icon of its own falls back to its first letter.
 pane_label() {
   local name="$1" slug="$2"
   case "$name" in
-    claude) printf 'cc:%s' "$slug"; return 0 ;;
-    opencode) printf 'oc:%s' "$slug"; return 0 ;;
-    pi) printf 'pi:%s' "$slug"; return 0 ;;
-    codex) printf 'cx:%s' "$slug"; return 0 ;;
+    # nf-cod-claude, U+EC82
+    claude) printf '\xee\xb2\x82 %s' "$slug"; return 0 ;;
+    # nf-md-alpha_o_box_outline, U+F0C15
+    opencode) printf '\xf3\xb0\xb0\x95 %s' "$slug"; return 0 ;;
+    # nf-md-numeric_0_box, U+F03A1
+    pi) printf '\xf3\xb0\x8e\xa1 %s' "$slug"; return 0 ;;
+    # nf-cod-openai, U+EC81
+    codex) printf '\xee\xb2\x81 %s' "$slug"; return 0 ;;
   esac
-  printf '%s:%s' \
+  printf '%s %s' \
     "$(LC_ALL=C printf '%s' "$name" | cut -c1 | tr '[:upper:]' '[:lower:]')" \
     "$slug"
 }
