@@ -16,7 +16,7 @@ changes that do not produce an event.
 ## Install
 
 ```bash
-herdr plugin install Seigiard/herdr-pane-labels --ref v0.2.3 -y
+herdr plugin install Seigiard/herdr-pane-labels --ref v0.3.0 -y
 herdr plugin enable seigi.pane-labels
 ```
 
