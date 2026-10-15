@@ -1802,13 +1802,15 @@ TREE
   parent_label="$(jq -r '.panes[] | select(.pane_id == "pane-1") | .label' "$state")"
   child_label="$(jq -r '.panes[] | select(.pane_id == "pane-3") | .label' "$state")"
 
-  # then: the parent agent fills all three rows: glyph and name with a
-  # two-space gap, the origin, and its pane label
+  # then: the parent agent carries glyph and name with a two-space gap, the
+  # origin, and its pane label after three no-break spaces
   run grep -q "^$(printf '\356\262\202')  " <<<"$parent_label" # nf-cod-claude U+EC82
   assert_success
   assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-1") | .tokens.headline' "$state")" "M  Task Name"
   assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-1") | .tokens.space_origin' "$state")" repository
-  assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-1") | .tokens.agent_line' "$state")" "$parent_label"
+  assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-1") | .tokens.agent_line' "$state")" "$(printf '\302\240\302\240\302\240')$parent_label"
+  run jq -e '.panes[] | select(.pane_id == "pane-1") | .tokens.child_gap == null' "$state"
+  assert_success
   # and: a shell pane without a glyph carries the bare name and no agent line
   assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-2") | .tokens.headline' "$state")" "Other"
   run jq -e '.panes[] | select(.pane_id == "pane-2") | .tokens.agent_line == null' "$state"
@@ -1817,6 +1819,8 @@ TREE
   assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-3") | .tokens.headline' "$state")" "- $child_label"
   run jq -e '.panes[] | select(.pane_id == "pane-3") | .tokens.space_origin == null and .tokens.agent_line == null' "$state"
   assert_success
+  # and: its spacer row holds one no-break space
+  assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-3") | .tokens.child_gap' "$state")" "$(printf '\302\240')"
 
   # when: the space is renamed and another pass runs
   hpl_set_workspace "$HPL_DEFAULT_SOCKET" '{"workspace_id":"ws-1","label":"Renamed","worktree":{"repo_name":"repository","is_linked_worktree":true}}'
