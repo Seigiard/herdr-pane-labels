@@ -19,8 +19,9 @@ SELF="$(script_path)" || exit 0
 SCRIPT_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd -P)" || exit 0
 # The alias library is package-owned. The checkout keeps it beside this script;
 # the installed shim keeps it under the package-owned library directory.
-if [ -f "$SCRIPT_DIR/../lib/herdr-aliases.sh" ]; then
-  ALIASES_LIBRARY="$SCRIPT_DIR/../lib/herdr-aliases.sh"
+CHECKOUT_ALIASES_LIBRARY="$SCRIPT_DIR/../lib/herdr-aliases.sh"
+if [ -f "$SCRIPT_DIR/../scripts/install-cli-shim.sh" ]; then
+  ALIASES_LIBRARY="$CHECKOUT_ALIASES_LIBRARY"
 else
   ALIASES_LIBRARY="$HOME/.local/lib/herdr-pane-labels/herdr-aliases.sh"
 fi
@@ -28,6 +29,7 @@ fi
 source "$ALIASES_LIBRARY" || exit 1
 
 PROCESS_LIBRARY="$HOME/.local/lib/herdr-process.sh"
+unset HERDR_PROCESS_API
 process_library_error() {
   local found="${HERDR_PROCESS_API:-}"
   [ -n "$found" ] || found=none
@@ -254,11 +256,9 @@ max_number() {
 }
 
 claim_owner_id=""
-claim_recovery_key=""
-claim_recovery_status=1
 
 recover_claim() {
-  local lock="$1" attempt="$2" owner pid start format socket identity_key identity_status
+  local lock="$1" attempt="$2" owner pid start format socket identity_status
   owner="$(read_state_field "$lock/owner" owner_id)"
   if [ -z "$owner" ]; then
     [ "$attempt" -ge 3 ] || return 1
@@ -274,15 +274,8 @@ recover_claim() {
   socket="$(read_state_field "$lock/owner" socket_path)"
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     if [ "$socket" = "$SOCKET_PATH" ]; then
-      identity_key="$pid|$start|$format|$socket"
-      if [ "$identity_key" = "$claim_recovery_key" ]; then
-        identity_status="$claim_recovery_status"
-      else
-        process_start_matches "$pid" "$start" "$format"
-        identity_status=$?
-        claim_recovery_key="$identity_key"
-        claim_recovery_status="$identity_status"
-      fi
+      process_start_matches "$pid" "$start" "$format"
+      identity_status=$?
       [ "$identity_status" -eq 1 ] || return 1
     fi
   fi
@@ -294,8 +287,6 @@ recover_claim() {
 
 acquire_claim() {
   local lock="$1" attempts="$2" attempt=0 owner start owner_record
-  claim_recovery_key=""
-  claim_recovery_status=1
   while [ "$attempt" -lt "$attempts" ]; do
     attempt=$((attempt + 1))
     if mkdir "$lock" 2>/dev/null; then
@@ -317,7 +308,9 @@ socket_path=$(encode_value "$SOCKET_PATH")"
       return 0
     fi
     recover_claim "$lock" "$attempt" || true
-    sleep 0.01
+    # The canonical matcher performs a ps probe on every retry. Keep the
+    # contention window bounded without adding the old memo back.
+    sleep 0
   done
   return 1
 }
