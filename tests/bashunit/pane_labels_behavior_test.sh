@@ -402,12 +402,11 @@ SH
   hpl_seed_presentation_inbox_lock "$namespace" "$owner_record"
   run hpl_event_run
   assert_success
-  run awk '
-    $1 != 3 || $2 != "ps-lstart-c-utc-v1" { exit 1 }
-    { calls += 1 }
-    END { exit calls == 0 }
-  ' "$calls"
+  run hpl_matcher_calls_are_v1 "$calls"
   assert_success
+  printf '3\tps-lstart-c-utc-v1\n2\t\n' > "$HPL_WORK/process-matcher.invalid.calls"
+  run hpl_matcher_calls_are_v1 "$HPL_WORK/process-matcher.invalid.calls"
+  assert_failure
 }
 
 function test_scripts_1214_herdr_pane_labels_reclaims_claims_by_the_v1_contract() {
@@ -446,7 +445,7 @@ function test_scripts_1214_herdr_pane_labels_reclaims_claims_by_the_v1_contract(
   owner="$lock/owner"
   owner_record="$(printf 'owner_id=%s\npid=%s\nprocess_start=%s\nsocket_path=%s\n' \
     "$(printf owner | base64 | tr -d '\n')" "$$" \
-    "$(printf '%s' "$marker" | base64 | tr -d '\n')" \
+    "$(printf 'Thu Jan 1 00:00:00 1970' | base64 | tr -d '\n')" \
     "$(printf '%s' "$HPL_DEFAULT_SOCKET" | base64 | tr -d '\n')")"
   hpl_seed_presentation_inbox_lock "$namespace" "$owner_record"
   run hpl_event_run
@@ -2161,7 +2160,9 @@ socket_path=$(printf '%s' "$HPL_DEFAULT_SOCKET" | base64 | tr -d '\n')"
   run hpl_event_run
   unset HERDR_PANE_LABELS_TEST_NO_DAEMON HERDR_PANE_LABELS_LOCK_ATTEMPTS
   assert_success
-  hpl_wait_for_file "$sweep_lock/pid"
+  hpl_wait_for_nonempty_file "$sweep_lock/pid"
+  hpl_wait_for_nonempty_file "$sweep_lock/start"
+  hpl_wait_for_nonempty_file "$sweep_lock/identity_format"
   assert_equal "$(hpl_record_number "$reconcile" pending_generation)" "$pending"
   pid="$(cat "$sweep_lock/pid")"
   assert_equal "$(cat "$sweep_lock/identity_format")" ps-lstart-c-utc-v1
@@ -2273,6 +2274,9 @@ SH
   assert_success
   assert_equal "$(cat "$sweep_lock/pid")" "$$"
   assert_equal "$(cat "$calls")" '3|'
+  run hpl_sweep_run --stop
+  assert_failure
+  assert_equal "$(cat "$sweep_lock/pid")" "$$"
 }
 
 function test_scripts_1218_herdr_pane_labels_reclaims_a_dead_v1_sweep_lock() {
@@ -2291,7 +2295,7 @@ function test_scripts_1218_herdr_pane_labels_reclaims_a_dead_v1_sweep_lock() {
   assert_success
   new_pid=""
   for _ in $(seq 1 200); do
-    if [ -s "$sweep_lock/pid" ]; then
+    if [ -s "$sweep_lock/pid" ] && [ -s "$sweep_lock/start" ] && [ -s "$sweep_lock/identity_format" ]; then
       new_pid="$(cat "$sweep_lock/pid")"
       [ "$new_pid" != 999999 ] && break
     fi
@@ -2304,6 +2308,103 @@ function test_scripts_1218_herdr_pane_labels_reclaims_a_dead_v1_sweep_lock() {
   format="$(cat "$sweep_lock/identity_format" 2>/dev/null || true)"
   kill "$new_pid" 2>/dev/null || true
   assert_equal "$format" ps-lstart-c-utc-v1
+}
+
+function test_scripts_1219_herdr_pane_labels_stop_stops_a_formatless_legacy_daemon() {
+  _bats_test_init 1219 'herdr-pane-labels --stop stops a formatless legacy sweep daemon'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local namespace sweep_lock legacy_pid
+  namespace="$(hpl_namespace "$HPL_DEFAULT_SOCKET")"
+  sweep_lock="$namespace/sweep.lock"
+  hpl_start_legacy_sweep_daemon legacy_pid
+  mkdir -p "$sweep_lock"
+  printf '%s\n' "$legacy_pid" > "$sweep_lock/pid"
+  printf '%s\n' 'Thu Jan 1 00:00:00 1970' > "$sweep_lock/start"
+
+  run hpl_sweep_run --stop
+  assert_success
+  run kill -0 "$legacy_pid"
+  assert_failure
+  assert_dir_not_exists "$sweep_lock"
+}
+
+function test_scripts_1220_herdr_pane_labels_ensure_replaces_a_formatless_legacy_da() {
+  _bats_test_init 1220 'herdr-pane-labels --ensure-sweep-daemon replaces a formatless legacy daemon'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local namespace sweep_lock legacy_pid new_pid="" _
+  namespace="$(hpl_namespace "$HPL_DEFAULT_SOCKET")"
+  sweep_lock="$namespace/sweep.lock"
+  hpl_start_legacy_sweep_daemon legacy_pid
+  mkdir -p "$sweep_lock"
+  printf '%s\n' "$legacy_pid" > "$sweep_lock/pid"
+  printf '%s\n' 'Thu Jan 1 00:00:00 1970' > "$sweep_lock/start"
+
+  run hpl_sweep_run --ensure-sweep-daemon
+  assert_success
+  for _ in $(seq 1 200); do
+    if [ -s "$sweep_lock/pid" ] && [ -s "$sweep_lock/start" ] && [ -s "$sweep_lock/identity_format" ]; then
+      new_pid="$(cat "$sweep_lock/pid")"
+      [ "$new_pid" != "$legacy_pid" ] && break
+    fi
+    sleep 0.01
+  done
+  run test -n "$new_pid"
+  assert_success
+  hpl_track_background_process "$new_pid"
+  assert_equal "$(cat "$sweep_lock/identity_format")" ps-lstart-c-utc-v1
+  run kill -0 "$legacy_pid"
+  assert_failure
+}
+
+function test_scripts_1221_herdr_pane_labels_stop_checks_a_matching_v1_daemon() {
+  _bats_test_init 1221 'herdr-pane-labels --stop checks and stops a matching v1 daemon'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local namespace sweep_lock legacy_pid marker calls="$HPL_WORK/process-matcher.calls"
+  namespace="$(hpl_namespace "$HPL_DEFAULT_SOCKET")"
+  sweep_lock="$namespace/sweep.lock"
+  hpl_start_legacy_sweep_daemon legacy_pid
+  marker="$(source "$SOURCE_ROOT/tests/fixtures/herdr-process.sh"; process_start_marker "$legacy_pid")"
+  sed 's/^process_start_matches()/canonical_process_start_matches()/' \
+    "$SOURCE_ROOT/tests/fixtures/herdr-process.sh" > "$HPL_HOME/.local/lib/herdr-process.sh"
+  cat >> "$HPL_HOME/.local/lib/herdr-process.sh" <<SH
+process_start_matches() {
+  printf '%s|%s\\n' "\$#" "\${3:-}" >> "$calls"
+  canonical_process_start_matches "\$@"
+}
+SH
+  mkdir -p "$sweep_lock"
+  printf '%s\n' "$legacy_pid" > "$sweep_lock/pid"
+  printf '%s\n' "$marker" > "$sweep_lock/start"
+  printf '%s\n' ps-lstart-c-utc-v1 > "$sweep_lock/identity_format"
+
+  run hpl_sweep_run --stop
+  assert_success
+  run kill -0 "$legacy_pid"
+  assert_failure
+  assert_equal "$(cat "$calls")" '3|ps-lstart-c-utc-v1'
+}
+
+function test_scripts_1222_herdr_pane_labels_stop_keeps_a_mismatched_v1_daemon() {
+  _bats_test_init 1222 'herdr-pane-labels --stop keeps a mismatched v1 daemon'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local namespace sweep_lock legacy_pid
+  namespace="$(hpl_namespace "$HPL_DEFAULT_SOCKET")"
+  sweep_lock="$namespace/sweep.lock"
+  hpl_start_legacy_sweep_daemon legacy_pid
+  mkdir -p "$sweep_lock"
+  printf '%s\n' "$legacy_pid" > "$sweep_lock/pid"
+  printf '%s\n' 'Thu Jan 1 00:00:00 1970' > "$sweep_lock/start"
+  printf '%s\n' ps-lstart-c-utc-v1 > "$sweep_lock/identity_format"
+
+  run hpl_sweep_run --stop
+  assert_failure
+  run kill -0 "$legacy_pid"
+  assert_success
+  assert_dir_exists "$sweep_lock"
 }
 
 function test_scripts_1165_herdr_pane_labels_sweep_repairs_an_external_pane_rename() {

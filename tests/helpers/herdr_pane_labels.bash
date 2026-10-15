@@ -41,8 +41,16 @@ HPL_ICON_PUSH="$(printf '\342\207\241')"     # U+21E1 upwards dashed arrow
 HPL_ICON_STALE="$(printf '\356\252\202')"    # nf-cod-history U+EA82
 
 hpl_teardown() {
+  local pid
+  for pid in ${HPL_BACKGROUND_PIDS:-}; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in ${HPL_BACKGROUND_PIDS:-}; do
+    wait "$pid" 2>/dev/null || true
+  done
   [[ -n "${HPL_WORK:-}" ]] && rm -rf "$HPL_WORK" || true
   unset HPL_WORK HPL_STUB HPL_STATE HPL_LOG HPL_DEFAULT_SOCKET HPL_SOCKET_ROOT HPL_HOME
+  unset HPL_BACKGROUND_PIDS
   unset HERDR_WORKTREE_IDENTITY_STATE_DIR
 }
 
@@ -822,6 +830,15 @@ hpl_wait_for_file() {
   return 1
 }
 
+hpl_wait_for_nonempty_file() {
+  local file="$1" _
+  for _ in $(seq 1 "$HPL_WAIT_POLLS"); do
+    [[ -s "$file" ]] && return 0
+    sleep 0.01
+  done
+  return 1
+}
+
 hpl_wait_for_socket_call() {
   local dir="$1" call_number="$2"
   hpl_wait_for_file "$dir/calls/$call_number"
@@ -924,11 +941,41 @@ hpl_location_source_seq() {
 # contention, and this was its third missed call site.
 hpl_sweep_run() {
   env HOME="$HPL_HOME" PATH="$HPL_STUB:/usr/bin:/bin" \
+    HERDR_SOCKET_PATH="$HPL_DEFAULT_SOCKET" \
     HERDR_PANE_LABELS_STATE_DIR="$HPL_STATE" \
     HERDR_PANE_LABELS_SWEEP_INTERVAL="${HPL_SWEEP_INTERVAL:-1}" \
     HERDR_PANE_LABELS_GIT_BUDGET="${HERDR_PANE_LABELS_GIT_BUDGET:-$HPL_GIT_BUDGET}" \
     HERDR_ALIAS_TEST_SEED="${HERDR_ALIAS_TEST_SEED:-}" \
     bash "$HPL_ENGINE" "$@"
+}
+
+hpl_start_legacy_sweep_daemon() {
+  local result_var="$1" daemon="$HPL_WORK/herdr-pane-labels" pid
+  cat > "$daemon" <<'SH'
+#!/usr/bin/env bash
+trap 'exit 0' INT TERM
+while :; do
+  sleep 0.05 &
+  wait $!
+done
+SH
+  chmod +x "$daemon"
+  "$daemon" --sweep-daemon &
+  pid=$!
+  HPL_BACKGROUND_PIDS="${HPL_BACKGROUND_PIDS:-} $pid"
+  printf -v "$result_var" '%s' "$pid"
+}
+
+hpl_track_background_process() {
+  HPL_BACKGROUND_PIDS="${HPL_BACKGROUND_PIDS:-} $1"
+}
+
+hpl_matcher_calls_are_v1() {
+  awk '
+    $1 != 3 || $2 != "ps-lstart-c-utc-v1" { invalid = 1; next }
+    { calls += 1 }
+    END { exit (invalid || calls == 0) }
+  ' "$1"
 }
 
 hpl_event_run() {
