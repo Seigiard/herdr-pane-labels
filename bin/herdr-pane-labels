@@ -373,6 +373,19 @@ retained_location=$(encode_value "$retained_location")"
   atomic_write "$file" "$content"
 }
 
+# herdr joins adjacent sidebar tokens with ` · ` and offers no setting to
+# change it (herdrdev/herdr#2045, closed as not planned). The machine glyph
+# a shell reports and the workspace name are therefore published as one
+# token, so the row can show them with a plain gap. Two spaces follow the
+# glyph for the same reason as after an agent icon.
+machine_workspace_value() {
+  local machine="$1" label="$2"
+  if [ -z "$machine" ]; then printf '%s' "$label"
+  elif [ -z "$label" ]; then printf '%s' "$machine"
+  else printf '%s  %s' "$machine" "$label"
+  fi
+}
+
 # A pane label opens with a one-cell agent icon, so several labels still fit
 # in the tab label. The icons are Nerd Font glyphs and need a patched font in
 # every terminal that shows herdr. They are written as UTF-8 byte escapes
@@ -1364,7 +1377,7 @@ reconcile_presentation_pass() {
   local roots root_tokens worktree git_ref ref place folder baseline
   local pane_id state_file retained_pane presented_ids
   local final_payload final_label final_tokens final_repo final_worktree final_branch final_status final_git_ref final_space_origin final_legacy
-  local space_origin
+  local space_origin machine_workspace workspace_labels workspace_label current_machine current_machine_workspace final_machine_workspace
   local location_changed location_seq
   local pane_count active_tab_count
   command -v jq >/dev/null 2>&1 || return 1
@@ -1405,9 +1418,10 @@ reconcile_presentation_pass() {
        ($p.revision|tostring),(($p.agent_session // null)|tojson),($p.label // ""),($a.name // ""),
        ($p.tokens.repo // ""),($p.tokens.worktree // ""),($p.tokens.branch // ""),
        ($p.tokens.location_status // ""),($p.tokens.git_ref // ""),
-       ($p.tokens.space_origin // ""),($p|@base64)]
-    | join("\u001f")' | filter_records_of_width 16 "$pane_count")" || return 1
-  baselines="$(printf '%s\n' "$pane_rows" | awk -F "$FIELD_SEPARATOR" -v OFS="$FIELD_SEPARATOR" 'NF {print $1,$10,$11,$12,$13,$14,$15}')"
+       ($p.tokens.space_origin // ""),($p.tokens.machine // ""),
+       ($p.tokens.machine_workspace // ""),($p|@base64)]
+    | join("\u001f")' | filter_records_of_width 18 "$pane_count")" || return 1
+  baselines="$(printf '%s\n' "$pane_rows" | awk -F "$FIELD_SEPARATOR" -v OFS="$FIELD_SEPARATOR" 'NF {print $1,$10,$11,$12,$13,$14,$15,$16,$17}')"
   # A worktree workspace names the space it was cut from. herdr already reports
   # that parent as worktree.repo_name, so no Git probe is needed. A workspace
   # whose own label already is the repository name (the main checkout) would
@@ -1422,10 +1436,14 @@ reconcile_presentation_pass() {
     | ((.worktree.repo_name) // "") as $origin
     | [.workspace_id, (if $origin == "" or $origin == $label then "" else $origin end)]
     | join("\u001f")')" || return 1
+  workspace_labels="$(printf '%s' "$snapshot" | jq -r '
+    .result.snapshot.workspaces[]
+    | [.workspace_id, (.label // .name // "")]
+    | join("\u001f")')" || return 1
   legacy_label_panes="$(printf '%s' "$snapshot" | jq -r '.result.snapshot.panes[] | select((.tokens.location_label // "") != "") | .pane_id')"
   trace_presentation_phase rows
 
-  while IFS="$FIELD_SEPARATOR" read -r id terminal tab_id workspace runtime revision session_json current alias current_repo current_worktree current_branch current_status current_git_ref current_space_origin pane_json_encoded; do
+  while IFS="$FIELD_SEPARATOR" read -r id terminal tab_id workspace runtime revision session_json current alias current_repo current_worktree current_branch current_status current_git_ref current_space_origin current_machine current_machine_workspace pane_json_encoded; do
     [ -n "$id" ] || continue
     pane_json="$(printf '%s' "$pane_json_encoded" | base64 -d 2>/dev/null)" || return 1
     location_file="$(location_state_file "$id")"
@@ -1466,7 +1484,7 @@ EOF
   [ "$child_failed" -eq 0 ] || return 1
   trace_presentation_phase locations
 
-  while IFS="$FIELD_SEPARATOR" read -r id terminal tab_id workspace runtime revision session_json current alias current_repo current_worktree current_branch current_status current_git_ref current_space_origin pane_json_encoded; do
+  while IFS="$FIELD_SEPARATOR" read -r id terminal tab_id workspace runtime revision session_json current alias current_repo current_worktree current_branch current_status current_git_ref current_space_origin current_machine current_machine_workspace pane_json_encoded; do
     [ -n "$id" ] || continue
     result="${probe_results%%$'\n'*}"; [ -n "$result" ] || return 1
     if [ "$probe_results" = "$result" ]; then probe_results=""; else probe_results="${probe_results#*$'\n'}"; fi
@@ -1560,7 +1578,7 @@ EOF
   while IFS="$FIELD_SEPARATOR" read -r id terminal tab_id workspace runtime revision session_json current intended outcome root anchor repo branch linked sha status git_ref worktree; do
     [ -n "$id" ] || continue
     baseline="$(table_row_for "$id" "$baselines")"
-    IFS="$FIELD_SEPARATOR" read -r current_repo current_worktree current_branch current_status current_git_ref current_space_origin <<EOF
+    IFS="$FIELD_SEPARATOR" read -r current_repo current_worktree current_branch current_status current_git_ref current_space_origin current_machine current_machine_workspace <<EOF
 $baseline
 EOF
     # The origin is a property of the pane's workspace, not of its Git probe,
@@ -1568,8 +1586,10 @@ EOF
     # herdr renders its own separator between row tokens, so the value is the
     # bare name.
     space_origin="$(table_value_for "$workspace" "$workspace_origins")"
+    machine_workspace="$(machine_workspace_value "$current_machine" "$(table_value_for "$workspace" "$workspace_labels")")"
     location_changed=0
     [ "$current_space_origin" = "$space_origin" ] || location_changed=1
+    [ "$current_machine_workspace" = "$machine_workspace" ] || location_changed=1
     if { [ -n "$repo" ] && [ -n "$worktree" ]; } || [ "$outcome" = non_git ]; then
       ! list_contains_line "$id" "$legacy_label_panes" || location_changed=1
     fi
@@ -1596,17 +1616,19 @@ EOF
         continue
       }
       if [ "$location_changed" -eq 1 ]; then
-        final_tokens="$(printf '%s' "$final_payload" | jq -r '.result.pane.tokens | [(.repo//""),(.worktree//""),(.branch//""),(.location_status//""),(.git_ref//""),(.space_origin//""),(.location_label//"")] | join("\u001f")')"
-        IFS="$FIELD_SEPARATOR" read -r final_repo final_worktree final_branch final_status final_git_ref final_space_origin final_legacy <<EOF
+        final_tokens="$(printf '%s' "$final_payload" | jq -r '.result.pane.tokens | [(.repo//""),(.worktree//""),(.branch//""),(.location_status//""),(.git_ref//""),(.space_origin//""),(.location_label//""),(.machine_workspace//"")] | join("\u001f")')"
+        IFS="$FIELD_SEPARATOR" read -r final_repo final_worktree final_branch final_status final_git_ref final_space_origin final_legacy final_machine_workspace <<EOF
 $final_tokens
 EOF
         if [ "$final_repo" != "$repo" ] || [ "$final_worktree" != "$worktree" ] || [ "$final_branch" != "$branch" ] ||
           [ "$final_status" != "$status" ] || [ "$final_git_ref" != "$git_ref" ] ||
-          [ "$final_space_origin" != "$space_origin" ] || [ -n "$final_legacy" ]; then
+          [ "$final_space_origin" != "$space_origin" ] || [ -n "$final_legacy" ] ||
+          [ "$final_machine_workspace" != "$machine_workspace" ]; then
           presentation_generation_valid "$pass" || return 2
           location_seq="$pass"
           set -- herdr pane report-metadata "$id" --source "$LOCATION_SOURCE_ID" --seq "$location_seq"
           if [ -n "$space_origin" ]; then set -- "$@" --token "space_origin=$space_origin"; else set -- "$@" --clear-token space_origin; fi
+          if [ -n "$machine_workspace" ]; then set -- "$@" --token "machine_workspace=$machine_workspace"; else set -- "$@" --clear-token machine_workspace; fi
           if [ -n "$repo" ] && [ -n "$worktree" ]; then
             set -- "$@" --token "repo=$repo" --token "worktree=$worktree" --token "git_ref=$git_ref" --clear-token pane_inline --clear-token location_label
             if [ -n "$branch" ]; then set -- "$@" --token "branch=$branch"; else set -- "$@" --clear-token branch; fi
@@ -1729,14 +1751,19 @@ EOF
     while IFS="$FIELD_SEPARATOR" read -r id terminal tab_id workspace runtime revision session_json current intended outcome root anchor repo branch linked sha status git_ref worktree; do
       [ -n "$id" ] || continue
       space_origin="$(table_value_for "$workspace" "$workspace_origins")"
+      workspace_label="$(table_value_for "$workspace" "$workspace_labels")"
       printf '%s' "$final_snapshot" | jq -e \
         --arg id "$id" --arg terminal "$terminal" --arg intended "$intended" \
         --arg outcome "$outcome" --arg repo "$repo" --arg worktree "$worktree" \
         --arg branch "$branch" --arg status "$status" --arg git_ref "$git_ref" \
-        --arg space_origin "$space_origin" '
+        --arg space_origin "$space_origin" --arg workspace_label "$workspace_label" '
           [.result.snapshot.panes[] | select(.pane_id == $id and .terminal_id == $terminal)] as $panes
           | ($panes | length) == 1 and ($panes[0].label == $intended)
             and (($panes[0].tokens.space_origin // "") == $space_origin)
+            and (($panes[0].tokens.machine_workspace // "") ==
+              (($panes[0].tokens.machine // "") as $m
+               | if $m == "" then $workspace_label elif $workspace_label == "" then $m
+                 else "\($m)  \($workspace_label)" end))
             and (if ($repo != "" and $worktree != "") then
               (($panes[0].tokens.repo // "") == $repo) and
               (($panes[0].tokens.worktree // "") == $worktree) and

@@ -1152,7 +1152,7 @@ function test_scripts_1134_herdr_pane_labels_location_detached_publishes_a_commi
   state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
   # The non-Git arm clears every Git token, keeps a foreign source's token, and
   # publishes the directory name as the only thing this pane can report.
-  assert_equal "$(jq -c '.panes[0].tokens' "$state")" "$(jq -nc --arg ref "$HPL_ICON_FOLDER non-git" '{foreign:"kept",git_ref:$ref}')"
+  assert_equal "$(jq -c '.panes[0].tokens' "$state")" "$(jq -nc --arg ref "$HPL_ICON_FOLDER non-git" '{foreign:"kept",machine_workspace:"repo",git_ref:$ref}')"
   run test "$(hpl_location_source_seq "$HPL_DEFAULT_SOCKET" pane-1)" -gt "$second_seq"
   assert_success
 }
@@ -1499,8 +1499,8 @@ function test_scripts_1142_herdr_pane_labels_transient_location_preserves_live_t
   run jq -e \
     --arg ref_one "$HPL_ICON_BRANCH topic-one $HPL_ICON_STALE" \
     --arg ref_two "$HPL_ICON_FOLDER live-token $HPL_ICON_STALE" '
-    (.panes[] | select(.pane_id == "pane-1") | .tokens == {repo:"live-repo",worktree:"live-token",branch:"topic-one",location_status:"stale",git_ref:$ref_one})
-    and (.panes[] | select(.pane_id == "pane-2") | .tokens == {repo:"live-repo",worktree:"live-token",location_status:"stale",git_ref:$ref_two})
+    (.panes[] | select(.pane_id == "pane-1") | .tokens == {repo:"live-repo",worktree:"live-token",branch:"topic-one",location_status:"stale",git_ref:$ref_one,machine_workspace:"ws-1"})
+    and (.panes[] | select(.pane_id == "pane-2") | .tokens == {repo:"live-repo",worktree:"live-token",location_status:"stale",git_ref:$ref_two,machine_workspace:"ws-1"})
   ' "$state"
   assert_success
   assert_equal "$(jq -r '.tabs[0].label' "$state")" "one · two · three"
@@ -1758,6 +1758,42 @@ function test_scripts_1206_herdr_pane_labels_names_the_space_a_worktree_space_ca
   assert_success
   run jq -e '.panes[] | select(.pane_id == "pane-3") | .tokens.space_origin == null' "$state"
   assert_success
+}
+
+function test_scripts_1224_herdr_pane_labels_joins_the_machine_glyph_and_space_nam() {
+  _bats_test_init 1224 'herdr-pane-labels joins the machine glyph and the space name into one token, and follows a rename'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  # given: one pane whose shell reported a machine glyph, and one whose shell
+  # reported none
+  local work="$HPL_WORK/work" state
+  mkdir -p "$work"
+  hpl_git_fixture "$work" "" 1 ready 'fatal: not a git repository'
+  hpl_set_pane "$HPL_DEFAULT_SOCKET" "$(hpl_process_pane_json pane-1 tab-1 "$work" | jq -c '.tokens.machine = "M"')"
+  hpl_set_pane "$HPL_DEFAULT_SOCKET" "$(hpl_process_pane_json pane-2 tab-2 "$work" | jq -c '.workspace_id = "ws-2"')"
+  hpl_set_tab "$HPL_DEFAULT_SOCKET" '{"tab_id":"tab-1","workspace_id":"ws-1","label":""}'
+  hpl_set_tab "$HPL_DEFAULT_SOCKET" '{"tab_id":"tab-2","workspace_id":"ws-2","label":""}'
+  hpl_set_workspace "$HPL_DEFAULT_SOCKET" '{"workspace_id":"ws-1","label":"Task Name"}'
+  hpl_set_workspace "$HPL_DEFAULT_SOCKET" '{"workspace_id":"ws-2","label":"Other"}'
+  hpl_set_process_label pane-1 one
+  hpl_set_process_label pane-2 two
+
+  # when: one location/presentation pass runs
+  hpl_location_pass
+  state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
+
+  # then: the glyph and the name share one token with a two-space gap, and a
+  # pane without a glyph carries the bare name
+  assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-1") | .tokens.machine_workspace' "$state")" "M  Task Name"
+  assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-2") | .tokens.machine_workspace' "$state")" "Other"
+
+  # when: the space is renamed and another pass runs
+  hpl_set_workspace "$HPL_DEFAULT_SOCKET" '{"workspace_id":"ws-1","label":"Renamed"}'
+  hpl_location_pass
+  state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
+
+  # then: the token follows the new name
+  assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-1") | .tokens.machine_workspace' "$state")" "M  Renamed"
 }
 
 function test_scripts_1207_herdr_pane_labels_reports_branch_and_counts_as_space_() {
