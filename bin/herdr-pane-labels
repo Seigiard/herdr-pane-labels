@@ -1602,9 +1602,11 @@ EOF
     # so it is looked up here rather than carried through the location record.
     # herdr renders its own separator between row tokens, so the value is the
     # bare name.
-    space_origin="$(table_value_for "$workspace" "$workspace_origins")"
     is_child=0
     ! list_contains_line "$id" "$child_panes" || is_child=1
+    # A child agent sits under its parent, which already names the origin.
+    space_origin=""
+    [ "$is_child" = 1 ] || space_origin="$(table_value_for "$workspace" "$workspace_origins")"
     machine_workspace="$(machine_workspace_value "$current_machine" "$(table_value_for "$workspace" "$workspace_labels")" "$is_child")"
     location_changed=0
     [ "$current_space_origin" = "$space_origin" ] || location_changed=1
@@ -1769,10 +1771,11 @@ EOF
     }
     while IFS="$FIELD_SEPARATOR" read -r id terminal tab_id workspace runtime revision session_json current intended outcome root anchor repo branch linked sha status git_ref worktree; do
       [ -n "$id" ] || continue
-      space_origin="$(table_value_for "$workspace" "$workspace_origins")"
       workspace_label="$(table_value_for "$workspace" "$workspace_labels")"
       is_child=false
       ! list_contains_line "$id" "$child_panes" || is_child=true
+      space_origin=""
+      [ "$is_child" = true ] || space_origin="$(table_value_for "$workspace" "$workspace_origins")"
       printf '%s' "$final_snapshot" | jq -e \
         --arg id "$id" --arg terminal "$terminal" --arg intended "$intended" \
         --arg outcome "$outcome" --arg repo "$repo" --arg worktree "$worktree" \

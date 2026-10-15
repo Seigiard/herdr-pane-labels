@@ -1775,9 +1775,9 @@ function test_scripts_1224_herdr_pane_labels_joins_the_machine_glyph_and_space_n
   hpl_set_tab "$HPL_DEFAULT_SOCKET" '{"tab_id":"tab-1","workspace_id":"ws-1","label":""}'
   hpl_set_tab "$HPL_DEFAULT_SOCKET" '{"tab_id":"tab-2","workspace_id":"ws-2","label":""}'
   hpl_set_tab "$HPL_DEFAULT_SOCKET" '{"tab_id":"tab-3","workspace_id":"ws-3","label":""}'
-  hpl_set_workspace "$HPL_DEFAULT_SOCKET" '{"workspace_id":"ws-1","label":"Task Name"}'
+  hpl_set_workspace "$HPL_DEFAULT_SOCKET" '{"workspace_id":"ws-1","label":"Task Name","worktree":{"repo_name":"repository","is_linked_worktree":true}}'
   hpl_set_workspace "$HPL_DEFAULT_SOCKET" '{"workspace_id":"ws-2","label":"Other"}'
-  hpl_set_workspace "$HPL_DEFAULT_SOCKET" '{"workspace_id":"ws-3","label":"Child Space"}'
+  hpl_set_workspace "$HPL_DEFAULT_SOCKET" '{"workspace_id":"ws-3","label":"Child Space","worktree":{"repo_name":"repository","is_linked_worktree":true}}'
   hpl_set_process_label pane-1 one
   hpl_set_process_label pane-2 two
   hpl_set_process_label pane-3 three
@@ -1799,10 +1799,13 @@ TREE
 
   # then: the glyph and the name share one token with a two-space gap, a
   # pane without a glyph carries the bare name, and a child agent reads a dash
-  # in place of the glyph
+  # in place of the glyph and drops the origin its parent already shows
   assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-1") | .tokens.machine_workspace' "$state")" "M  Task Name"
   assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-2") | .tokens.machine_workspace' "$state")" "Other"
   assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-3") | .tokens.machine_workspace' "$state")" "- Child Space"
+  assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-1") | .tokens.space_origin' "$state")" repository
+  run jq -e '.panes[] | select(.pane_id == "pane-3") | .tokens.space_origin == null' "$state"
+  assert_success
 
   # when: the space is renamed and another pass runs
   hpl_set_workspace "$HPL_DEFAULT_SOCKET" '{"workspace_id":"ws-1","label":"Renamed"}'
