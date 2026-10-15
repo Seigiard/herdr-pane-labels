@@ -2835,6 +2835,42 @@ SH
   assert_dir_not_exists "$(hpl_namespace "$HPL_DEFAULT_SOCKET")/sweep.lock"
 }
 
+function test_scripts_1225_herdr_pane_labels_sweep_daemon_exits_when_its_install_is() {
+  _bats_test_init 1225 'herdr-pane-labels sweep daemon exits when its install is removed'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  hpl_set_agent_pane "$HPL_DEFAULT_SOCKET" pane-1 tab-1 ws-1 term-1 claude
+  # herdr installs each plugin version into a directory of its own and removes
+  # the old one. A daemon that outlives its directory keeps sweeping with the
+  # old code and overwrites what the new version publishes.
+  local install="$HPL_WORK/install" daemon_pid i
+  mkdir -p "$install"
+  cp -R "$SOURCE_ROOT/bin" "$SOURCE_ROOT/lib" "$SOURCE_ROOT/scripts" "$install/"
+  HPL_ENGINE="$install/bin/herdr-pane-labels" HPL_SWEEP_INTERVAL=0.05 \
+    hpl_sweep_run --sweep-daemon &
+  daemon_pid=$!
+  for i in $(seq 1 $HPL_WAIT_POLLS); do
+    [ ! -s "$(hpl_namespace "$HPL_DEFAULT_SOCKET")/sweep.lock/start" ] || break
+    sleep 0.01
+  done
+  # A healthy daemon keeps running: the control for the exit below.
+  sleep 0.3
+  run kill -0 "$daemon_pid"
+  assert_success
+  rm -rf "$install"
+  for i in $(seq 1 $HPL_WAIT_POLLS); do
+    kill -0 "$daemon_pid" 2>/dev/null || break
+    sleep 0.01
+  done
+  if kill -0 "$daemon_pid" 2>/dev/null; then
+    kill "$daemon_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    fail "sweep daemon kept running after its install was removed"
+  fi
+  wait "$daemon_pid"
+  assert_dir_not_exists "$(hpl_namespace "$HPL_DEFAULT_SOCKET")/sweep.lock"
+}
+
 function test_scripts_1179_herdr_pane_labels_names_an_agent_whose_fresh_pane_repor() {
   _bats_test_init 1179 'herdr-pane-labels names an agent whose fresh pane reports no label yet'
   command -v jq >/dev/null || skip "jq not available"

@@ -1943,6 +1943,12 @@ run_sweep_daemon() {
     # Whoever holds the pid file owns the sweep. Losing it means another daemon
     # took over, and two daemons would rename every tab twice per interval.
     [ "$(cat "$SWEEP_LOCK_DIR/pid" 2>/dev/null)" = "$$" ] || exit 0
+    # herdr installs each plugin version into a directory of its own and
+    # removes the previous one, but leaves this process running. Bash already
+    # holds the old code in memory, so the daemon would keep sweeping with it
+    # and overwrite what the new version publishes. Exiting releases the lock;
+    # the next startup or agent-status hook starts the current version.
+    [ -f "$SELF" ] || exit 0
     if sweep_tabs; then
       misses=0
     else
