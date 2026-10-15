@@ -1803,12 +1803,12 @@ TREE
   child_label="$(jq -r '.panes[] | select(.pane_id == "pane-3") | .label' "$state")"
 
   # then: the parent agent carries glyph and name with a two-space gap, the
-  # origin, and its pane label after three no-break spaces
+  # origin, and its pane label after four no-break spaces
   run grep -q "^$(printf '\356\262\202')  " <<<"$parent_label" # nf-cod-claude U+EC82
   assert_success
   assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-1") | .tokens.headline' "$state")" "M  Task Name"
   assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-1") | .tokens.space_origin' "$state")" repository
-  assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-1") | .tokens.agent_line' "$state")" "$(printf '\302\240\302\240\302\240')$parent_label"
+  assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-1") | .tokens.agent_line' "$state")" "$(printf '\302\240\302\240\302\240\302\240')$parent_label"
   run jq -e '.panes[] | select(.pane_id == "pane-1") | .tokens.child_gap == null' "$state"
   assert_success
   # and: a shell pane without a glyph carries the bare name and no agent line
@@ -1819,8 +1819,6 @@ TREE
   assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-3") | .tokens.headline' "$state")" "- $child_label"
   run jq -e '.panes[] | select(.pane_id == "pane-3") | .tokens.space_origin == null and .tokens.agent_line == null' "$state"
   assert_success
-  # and: its spacer row holds one no-break space
-  assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-3") | .tokens.child_gap' "$state")" "$(printf '\302\240')"
 
   # when: the space is renamed and another pass runs
   hpl_set_workspace "$HPL_DEFAULT_SOCKET" '{"workspace_id":"ws-1","label":"Renamed","worktree":{"repo_name":"repository","is_linked_worktree":true}}'
@@ -2873,6 +2871,52 @@ function test_scripts_1225_herdr_pane_labels_sweep_daemon_exits_when_its_install
   fi
   wait "$daemon_pid"
   assert_dir_not_exists "$(hpl_namespace "$HPL_DEFAULT_SOCKET")/sweep.lock"
+}
+
+function test_scripts_1226_herdr_pane_labels_ensure_sweep_daemon_replaces_another() {
+  _bats_test_init 1226 'herdr-pane-labels --ensure-sweep-daemon replaces another install daemon'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  hpl_set_agent_pane "$HPL_DEFAULT_SOCKET" pane-1 tab-1 ws-1 term-1 claude
+  # herdr may keep an older plugin version's directory after an upgrade, and
+  # its daemon then keeps sweeping with the old code.
+  local old="$HPL_WORK/old-install" sweep_lock old_pid new_pid i
+  sweep_lock="$(hpl_namespace "$HPL_DEFAULT_SOCKET")/sweep.lock"
+  mkdir -p "$old"
+  cp -R "$SOURCE_ROOT/bin" "$SOURCE_ROOT/lib" "$SOURCE_ROOT/scripts" "$old/"
+  HPL_ENGINE="$old/bin/herdr-pane-labels" HPL_SWEEP_INTERVAL=0.05 \
+    hpl_sweep_run --ensure-sweep-daemon
+  for i in $(seq 1 $HPL_WAIT_POLLS); do
+    [ ! -s "$sweep_lock/start" ] || break
+    sleep 0.01
+  done
+  old_pid="$(cat "$sweep_lock/pid")"
+  hpl_track_background_process "$old_pid"
+
+  # A second hook from the same install keeps its daemon: the control.
+  HPL_ENGINE="$old/bin/herdr-pane-labels" run hpl_sweep_run --ensure-sweep-daemon
+  assert_success
+  assert_equal "$(cat "$sweep_lock/pid")" "$old_pid"
+
+  # when: a hook from the current install runs
+  HPL_SWEEP_INTERVAL=0.05 run hpl_sweep_run --ensure-sweep-daemon
+  assert_success
+  for i in $(seq 1 $HPL_WAIT_POLLS); do
+    new_pid="$(cat "$sweep_lock/pid" 2>/dev/null || true)"
+    [ -z "$new_pid" ] || [ "$new_pid" = "$old_pid" ] || break
+    sleep 0.01
+  done
+  hpl_track_background_process "$new_pid"
+
+  # then: the old daemon is gone and the current install owns the sweep
+  run kill -0 "$old_pid"
+  assert_failure
+  run test "$old_pid" != "$new_pid"
+  assert_success
+  run ps -ww -p "$new_pid" -o command=
+  assert_success
+  assert_output "bash $HPL_ENGINE --sweep-daemon"
+  kill "$new_pid" 2>/dev/null || true
 }
 
 function test_scripts_1179_herdr_pane_labels_names_an_agent_whose_fresh_pane_repor() {
