@@ -42,6 +42,9 @@ HPL_ICON_STALE="$(printf '\356\252\202')"    # nf-cod-history U+EA82
 
 hpl_teardown() {
   local pid
+  for pid in ${HPL_BACKGROUND_PROCESS_GROUPS:-}; do
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  done
   for pid in ${HPL_BACKGROUND_PIDS:-}; do
     kill -TERM "$pid" 2>/dev/null || true
   done
@@ -50,7 +53,7 @@ hpl_teardown() {
   done
   [[ -n "${HPL_WORK:-}" ]] && rm -rf "$HPL_WORK" || true
   unset HPL_WORK HPL_STUB HPL_STATE HPL_LOG HPL_DEFAULT_SOCKET HPL_SOCKET_ROOT HPL_HOME
-  unset HPL_BACKGROUND_PIDS
+  unset HPL_BACKGROUND_PIDS HPL_BACKGROUND_PROCESS_GROUPS
   unset HERDR_WORKTREE_IDENTITY_STATE_DIR
 }
 
@@ -839,6 +842,19 @@ hpl_wait_for_nonempty_file() {
   return 1
 }
 
+hpl_wait_for_interval_sleep() {
+  local daemon_pid="$1" interval_sleep_pid _
+  for _ in $(seq 1 "$HPL_WAIT_POLLS"); do
+    interval_sleep_pid="$(pgrep -P "$daemon_pid" -x sleep 2>/dev/null | head -n 1)"
+    if [ -n "$interval_sleep_pid" ]; then
+      printf '%s\n' "$interval_sleep_pid"
+      return 0
+    fi
+    sleep 0.01
+  done
+  return 1
+}
+
 hpl_wait_for_socket_call() {
   local dir="$1" call_number="$2"
   hpl_wait_for_file "$dir/calls/$call_number"
@@ -955,19 +971,24 @@ hpl_start_legacy_sweep_daemon() {
 #!/usr/bin/env bash
 trap 'exit 0' INT TERM
 while :; do
-  sleep 0.05 &
-  wait $!
+  sleep 3
 done
 SH
   chmod +x "$daemon"
+  set -m
   "$daemon" --sweep-daemon &
   pid=$!
-  HPL_BACKGROUND_PIDS="${HPL_BACKGROUND_PIDS:-} $pid"
+  set +m
+  hpl_track_background_process "$pid"
   printf -v "$result_var" '%s' "$pid"
 }
 
 hpl_track_background_process() {
-  HPL_BACKGROUND_PIDS="${HPL_BACKGROUND_PIDS:-} $1"
+  local pid="$1" pgid
+  HPL_BACKGROUND_PIDS="${HPL_BACKGROUND_PIDS:-} $pid"
+  pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
+  [ "$pgid" != "$pid" ] || \
+    HPL_BACKGROUND_PROCESS_GROUPS="${HPL_BACKGROUND_PROCESS_GROUPS:-} $pid"
 }
 
 hpl_matcher_calls_are_v1() {

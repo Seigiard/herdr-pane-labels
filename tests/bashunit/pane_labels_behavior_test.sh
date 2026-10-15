@@ -2314,10 +2314,14 @@ function test_scripts_1219_herdr_pane_labels_stop_stops_a_formatless_legacy_daem
   _bats_test_init 1219 'herdr-pane-labels --stop stops a formatless legacy sweep daemon'
   command -v jq >/dev/null || skip "jq not available"
   hpl_setup
-  local namespace sweep_lock legacy_pid
+  local namespace sweep_lock legacy_pid interval_sleep_pid
   namespace="$(hpl_namespace "$HPL_DEFAULT_SOCKET")"
   sweep_lock="$namespace/sweep.lock"
   hpl_start_legacy_sweep_daemon legacy_pid
+  run hpl_wait_for_interval_sleep "$legacy_pid"
+  assert_success
+  # shellcheck disable=SC2154
+  interval_sleep_pid="$output"
   mkdir -p "$sweep_lock"
   printf '%s\n' "$legacy_pid" > "$sweep_lock/pid"
   printf '%s\n' 'Thu Jan 1 00:00:00 1970' > "$sweep_lock/start"
@@ -2326,6 +2330,8 @@ function test_scripts_1219_herdr_pane_labels_stop_stops_a_formatless_legacy_daem
   assert_success
   run kill -0 "$legacy_pid"
   assert_failure
+  run kill -0 "$interval_sleep_pid"
+  assert_failure
   assert_dir_not_exists "$sweep_lock"
 }
 
@@ -2333,10 +2339,14 @@ function test_scripts_1220_herdr_pane_labels_ensure_replaces_a_formatless_legacy
   _bats_test_init 1220 'herdr-pane-labels --ensure-sweep-daemon replaces a formatless legacy daemon'
   command -v jq >/dev/null || skip "jq not available"
   hpl_setup
-  local namespace sweep_lock legacy_pid new_pid="" _
+  local namespace sweep_lock legacy_pid interval_sleep_pid new_pid="" _
   namespace="$(hpl_namespace "$HPL_DEFAULT_SOCKET")"
   sweep_lock="$namespace/sweep.lock"
   hpl_start_legacy_sweep_daemon legacy_pid
+  run hpl_wait_for_interval_sleep "$legacy_pid"
+  assert_success
+  # shellcheck disable=SC2154
+  interval_sleep_pid="$output"
   mkdir -p "$sweep_lock"
   printf '%s\n' "$legacy_pid" > "$sweep_lock/pid"
   printf '%s\n' 'Thu Jan 1 00:00:00 1970' > "$sweep_lock/start"
@@ -2356,6 +2366,42 @@ function test_scripts_1220_herdr_pane_labels_ensure_replaces_a_formatless_legacy
   assert_equal "$(cat "$sweep_lock/identity_format")" ps-lstart-c-utc-v1
   run kill -0 "$legacy_pid"
   assert_failure
+  run kill -0 "$interval_sleep_pid"
+  assert_failure
+}
+
+function test_scripts_1223_herdr_pane_labels_stop_stops_a_v1_daemon_during_its_inte() {
+  _bats_test_init 1223 'herdr-pane-labels --stop stops a v1 sweep daemon during its interval sleep'
+  command -v jq >/dev/null || skip "jq not available"
+  hpl_setup
+  local namespace sweep_lock daemon_pid="" interval_sleep_pid _
+  namespace="$(hpl_namespace "$HPL_DEFAULT_SOCKET")"
+  sweep_lock="$namespace/sweep.lock"
+
+  HPL_SWEEP_INTERVAL=3 hpl_sweep_run --ensure-sweep-daemon
+  assert_success
+  for _ in $(seq 1 200); do
+    if [ -s "$sweep_lock/pid" ] && [ -s "$sweep_lock/start" ] && [ -s "$sweep_lock/identity_format" ]; then
+      daemon_pid="$(cat "$sweep_lock/pid")"
+      break
+    fi
+    sleep 0.01
+  done
+  run test -n "$daemon_pid"
+  assert_success
+  hpl_track_background_process "$daemon_pid"
+  run hpl_wait_for_interval_sleep "$daemon_pid"
+  assert_success
+  # shellcheck disable=SC2154
+  interval_sleep_pid="$output"
+
+  HPL_SWEEP_INTERVAL=3 run hpl_sweep_run --stop
+  assert_success
+  run kill -0 "$daemon_pid"
+  assert_failure
+  run kill -0 "$interval_sleep_pid"
+  assert_failure
+  assert_dir_not_exists "$sweep_lock"
 }
 
 function test_scripts_1221_herdr_pane_labels_stop_checks_a_matching_v1_daemon() {
