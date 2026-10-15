@@ -21,7 +21,7 @@ function test_herdr_pane_labels_descriptor_001_herdr_pane_labels_descriptor_chil
   hpl_set_process_label pane-1 btop
   hpl_request_only
   : > "$HPL_WORK/block-herdr"
-  env PATH="$HPL_STUB:/usr/bin:/bin" \
+  env HOME="$HPL_HOME" PATH="$HPL_STUB:/usr/bin:/bin" \
     HERDR_SOCKET_PATH="$HPL_DEFAULT_SOCKET" \
     HERDR_PANE_LABELS_STATE_DIR="$HPL_STATE" \
     HERDR_PANE_LABELS_GIT_BUDGET="$HPL_GIT_BUDGET" \

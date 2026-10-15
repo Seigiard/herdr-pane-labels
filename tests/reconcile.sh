@@ -15,6 +15,11 @@ pass() {
   printf 'ok - %s\n' "$1"
 }
 
+prepare_home() {
+  mkdir -p "$WORK/home/.local/lib"
+  cp "$ROOT/tests/fixtures/herdr-process.sh" "$WORK/home/.local/lib/herdr-process.sh"
+}
+
 write_snapshot() {
   local complete="$1" label="${2:-old}"
   jq -cn --argjson complete "$complete" --arg label "$label" \
@@ -55,6 +60,7 @@ SH
 }
 
 test_complete_snapshot_and_conflict_retry() {
+  prepare_home
   write_snapshot true
   write_herdr
   : > "$WORK/writes"
@@ -69,6 +75,7 @@ test_complete_snapshot_and_conflict_retry() {
 }
 
 test_incomplete_snapshot_is_rejected() {
+  prepare_home
   write_snapshot false
   write_herdr
   : > "$WORK/writes"

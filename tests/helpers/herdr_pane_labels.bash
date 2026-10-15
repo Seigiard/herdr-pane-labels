@@ -42,7 +42,7 @@ HPL_ICON_STALE="$(printf '\356\252\202')"    # nf-cod-history U+EA82
 
 hpl_teardown() {
   [[ -n "${HPL_WORK:-}" ]] && rm -rf "$HPL_WORK" || true
-  unset HPL_WORK HPL_STUB HPL_STATE HPL_LOG HPL_DEFAULT_SOCKET HPL_SOCKET_ROOT
+  unset HPL_WORK HPL_STUB HPL_STATE HPL_LOG HPL_DEFAULT_SOCKET HPL_SOCKET_ROOT HPL_HOME
   unset HERDR_WORKTREE_IDENTITY_STATE_DIR
 }
 
@@ -452,13 +452,15 @@ hpl_setup() {
   HPL_WORK="$(mktemp -d "${BATS_TMPDIR:-/tmp}/hpl.XXXXXX")"
   HPL_STUB="$HPL_WORK/stub"
   HPL_STATE="$HPL_WORK/state"
+  HPL_HOME="$HPL_WORK/home"
   HPL_LOG="$HPL_WORK/herdr.log"
   HPL_DEFAULT_SOCKET="$HPL_WORK/session.sock"
   HPL_SOCKET_ROOT="$HPL_WORK/sockets"
-  export HPL_WORK HPL_DEFAULT_SOCKET HPL_SOCKET_ROOT
+  export HPL_WORK HPL_HOME HPL_DEFAULT_SOCKET HPL_SOCKET_ROOT
   export HERDR_WORKTREE_IDENTITY_STATE_DIR="$HPL_WORK/agent-cwd-state"
   export HERDR_SOCKET_PATH="$HPL_DEFAULT_SOCKET"
-  mkdir -p "$HPL_STUB" "$HPL_STATE" "$HPL_SOCKET_ROOT/socket-1"
+  mkdir -p "$HPL_STUB" "$HPL_STATE" "$HPL_SOCKET_ROOT/socket-1" "$HPL_HOME/.local/lib"
+  cp "$SOURCE_ROOT/tests/fixtures/herdr-process.sh" "$HPL_HOME/.local/lib/herdr-process.sh"
   : > "$HPL_LOG"
   printf '%s' "$HPL_DEFAULT_SOCKET" > "$HPL_SOCKET_ROOT/socket-1/socket-path"
   printf '%s' "$HPL_LOG" > "$HPL_SOCKET_ROOT/socket-1/log-path"
@@ -921,7 +923,7 @@ hpl_location_source_seq() {
 # budget calibrated on an unloaded host becomes a latent flake under job
 # contention, and this was its third missed call site.
 hpl_sweep_run() {
-  env PATH="$HPL_STUB:/usr/bin:/bin" \
+  env HOME="$HPL_HOME" PATH="$HPL_STUB:/usr/bin:/bin" \
     HERDR_PANE_LABELS_STATE_DIR="$HPL_STATE" \
     HERDR_PANE_LABELS_SWEEP_INTERVAL="${HPL_SWEEP_INTERVAL:-1}" \
     HERDR_PANE_LABELS_GIT_BUDGET="${HERDR_PANE_LABELS_GIT_BUDGET:-$HPL_GIT_BUDGET}" \
@@ -930,7 +932,7 @@ hpl_sweep_run() {
 }
 
 hpl_event_run() {
-  env PATH="$HPL_STUB:/usr/bin:/bin" \
+  env HOME="$HPL_HOME" PATH="$HPL_STUB:/usr/bin:/bin" \
     HERDR_SOCKET_PATH="$HPL_DEFAULT_SOCKET" \
     HERDR_PANE_LABELS_STATE_DIR="$HPL_STATE" \
     HERDR_PANE_LABELS_TEST_NO_PRESENTATION="${HERDR_PANE_LABELS_TEST_NO_PRESENTATION:-}" \
@@ -950,7 +952,7 @@ hpl_request_only() {
 
 hpl_event_run_for_socket() {
   local socket_path="$1"
-  env PATH="$HPL_STUB:/usr/bin:/bin" \
+  env HOME="$HPL_HOME" PATH="$HPL_STUB:/usr/bin:/bin" \
     HERDR_SOCKET_PATH="$socket_path" \
     HERDR_PANE_LABELS_STATE_DIR="$HPL_STATE" \
     HERDR_PANE_LABELS_TEST_NO_PRESENTATION="${HERDR_PANE_LABELS_TEST_NO_PRESENTATION:-}" \
@@ -959,7 +961,7 @@ hpl_event_run_for_socket() {
 }
 
 hpl_presentation_run() {
-  env PATH="$HPL_STUB:/usr/bin:/bin" \
+  env HOME="$HPL_HOME" PATH="$HPL_STUB:/usr/bin:/bin" \
     HERDR_SOCKET_PATH="$HPL_DEFAULT_SOCKET" \
     HERDR_PANE_LABELS_STATE_DIR="$HPL_STATE" \
     HERDR_PANE_LABELS_TEST_CRASH_AFTER="${HERDR_PANE_LABELS_TEST_CRASH_AFTER:-}" \
