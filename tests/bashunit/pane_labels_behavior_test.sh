@@ -1761,31 +1761,48 @@ function test_scripts_1206_herdr_pane_labels_names_the_space_a_worktree_space_ca
 }
 
 function test_scripts_1224_herdr_pane_labels_joins_the_machine_glyph_and_space_nam() {
-  _bats_test_init 1224 'herdr-pane-labels joins the machine glyph and the space name into one token, and follows a rename'
+  _bats_test_init 1224 'herdr-pane-labels joins the machine glyph and the space name into one token, marks a child agent, and follows a rename'
   command -v jq >/dev/null || skip "jq not available"
   hpl_setup
-  # given: one pane whose shell reported a machine glyph, and one whose shell
-  # reported none
+  # given: a pane whose shell reported a machine glyph, a pane whose shell
+  # reported none, and a pane the resource tree records as a child agent
   local work="$HPL_WORK/work" state
   mkdir -p "$work"
   hpl_git_fixture "$work" "" 1 ready 'fatal: not a git repository'
   hpl_set_pane "$HPL_DEFAULT_SOCKET" "$(hpl_process_pane_json pane-1 tab-1 "$work" | jq -c '.tokens.machine = "M"')"
   hpl_set_pane "$HPL_DEFAULT_SOCKET" "$(hpl_process_pane_json pane-2 tab-2 "$work" | jq -c '.workspace_id = "ws-2"')"
+  hpl_set_pane "$HPL_DEFAULT_SOCKET" "$(hpl_process_pane_json pane-3 tab-3 "$work" | jq -c '.workspace_id = "ws-3" | .tokens.machine = "M"')"
   hpl_set_tab "$HPL_DEFAULT_SOCKET" '{"tab_id":"tab-1","workspace_id":"ws-1","label":""}'
   hpl_set_tab "$HPL_DEFAULT_SOCKET" '{"tab_id":"tab-2","workspace_id":"ws-2","label":""}'
+  hpl_set_tab "$HPL_DEFAULT_SOCKET" '{"tab_id":"tab-3","workspace_id":"ws-3","label":""}'
   hpl_set_workspace "$HPL_DEFAULT_SOCKET" '{"workspace_id":"ws-1","label":"Task Name"}'
   hpl_set_workspace "$HPL_DEFAULT_SOCKET" '{"workspace_id":"ws-2","label":"Other"}'
+  hpl_set_workspace "$HPL_DEFAULT_SOCKET" '{"workspace_id":"ws-3","label":"Child Space"}'
   hpl_set_process_label pane-1 one
   hpl_set_process_label pane-2 two
+  hpl_set_process_label pane-3 three
+  cat > "$HPL_STUB/herdr-resource-tree" <<'TREE'
+#!/bin/sh
+[ "$1" = --json ] || exit 2
+cat <<'JSON'
+{"schema_version":3,"workspaces":[
+ {"id":"ws-1","tabs":[{"id":"tab-1","panes":[{"id":"pane-1","agent":{"client":"claude","parent_session":null}}]}]},
+ {"id":"ws-3","tabs":[{"id":"tab-3","panes":[{"id":"pane-3","agent":{"client":"claude","parent_session":{"agent":"claude","kind":"id","value":"parent"}}}]}]}
+]}
+JSON
+TREE
+  chmod +x "$HPL_STUB/herdr-resource-tree"
 
   # when: one location/presentation pass runs
   hpl_location_pass
   state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
 
-  # then: the glyph and the name share one token with a two-space gap, and a
-  # pane without a glyph carries the bare name
+  # then: the glyph and the name share one token with a two-space gap, a
+  # pane without a glyph carries the bare name, and a child agent reads a dash
+  # in place of the glyph
   assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-1") | .tokens.machine_workspace' "$state")" "M  Task Name"
   assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-2") | .tokens.machine_workspace' "$state")" "Other"
+  assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-3") | .tokens.machine_workspace' "$state")" "- Child Space"
 
   # when: the space is renamed and another pass runs
   hpl_set_workspace "$HPL_DEFAULT_SOCKET" '{"workspace_id":"ws-1","label":"Renamed"}'
