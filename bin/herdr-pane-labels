@@ -377,18 +377,20 @@ retained_location=$(encode_value "$retained_location")"
 # in the tab label. The icons are Nerd Font glyphs and need a patched font in
 # every terminal that shows herdr. They are written as UTF-8 byte escapes
 # because Private Use Area characters get lost when source text is copied.
+# Two spaces follow an icon: terminals draw these glyphs wider than one cell,
+# so the icon covers a single space and touches the name.
 # An agent with no icon of its own falls back to its first letter.
 pane_label() {
   local name="$1" slug="$2"
   case "$name" in
     # nf-cod-claude, U+EC82
-    claude) printf '\xee\xb2\x82 %s' "$slug"; return 0 ;;
+    claude) printf '\xee\xb2\x82  %s' "$slug"; return 0 ;;
     # nf-md-alpha_o_box_outline, U+F0C15
-    opencode) printf '\xf3\xb0\xb0\x95 %s' "$slug"; return 0 ;;
+    opencode) printf '\xf3\xb0\xb0\x95  %s' "$slug"; return 0 ;;
     # nf-md-numeric_0_box, U+F03A1
-    pi) printf '\xf3\xb0\x8e\xa1 %s' "$slug"; return 0 ;;
+    pi) printf '\xf3\xb0\x8e\xa1  %s' "$slug"; return 0 ;;
     # nf-cod-openai, U+EC81
-    codex) printf '\xee\xb2\x81 %s' "$slug"; return 0 ;;
+    codex) printf '\xee\xb2\x81  %s' "$slug"; return 0 ;;
   esac
   printf '%s %s' \
     "$(LC_ALL=C printf '%s' "$name" | cut -c1 | tr '[:upper:]' '[:lower:]')" \

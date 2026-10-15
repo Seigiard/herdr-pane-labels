@@ -274,7 +274,7 @@ EOF
   assert_equal "$aliases" 5
   assert_equal "$(printf '%s\n' "$names" | sort -u | wc -l | tr -d ' ')" 5
   assert_equal "$(jq -r '[.panes[].label] | join("|")' "$state")" \
-    " $(jq -r '.agents[] | select(.pane_id == "pane-1").name' "$state")|󰰕 $(jq -r '.agents[] | select(.pane_id == "pane-2").name' "$state")|󰎡 $(jq -r '.agents[] | select(.pane_id == "pane-3").name' "$state")| $(jq -r '.agents[] | select(.pane_id == "pane-4").name' "$state")|g $(jq -r '.agents[] | select(.pane_id == "pane-5").name' "$state")"
+    "  $(jq -r '.agents[] | select(.pane_id == "pane-1").name' "$state")|󰰕  $(jq -r '.agents[] | select(.pane_id == "pane-2").name' "$state")|󰎡  $(jq -r '.agents[] | select(.pane_id == "pane-3").name' "$state")|  $(jq -r '.agents[] | select(.pane_id == "pane-4").name' "$state")|g $(jq -r '.agents[] | select(.pane_id == "pane-5").name' "$state")"
   assert_equal "$(jq -r '.tabs[0].label' "$state")" "$(jq -r '[.panes[].label] | join(" · ")' "$state")"
   unset HERDR_ALIAS_TEST_SEED
 }
@@ -286,7 +286,7 @@ function test_scripts_1109_herdr_pane_labels_preserves_a_unique_pool_alias_acros
   hpl_set_agent_pane "$HPL_DEFAULT_SOCKET" pane-1 tab-1 ws-1 term-1 claude red-wolf
   hpl_sweep_run --sweep
   assert_equal "$(jq -r '.agents[0].name' "$(hpl_socket_state "$HPL_DEFAULT_SOCKET")")" red-wolf
-  assert_equal "$(jq -r '.panes[0].label' "$(hpl_socket_state "$HPL_DEFAULT_SOCKET")")" " red-wolf"
+  assert_equal "$(jq -r '.panes[0].label' "$(hpl_socket_state "$HPL_DEFAULT_SOCKET")")" "  red-wolf"
 
   : > "$HPL_LOG"
   hpl_sweep_run --sweep
@@ -307,8 +307,8 @@ function test_scripts_1110_herdr_pane_labels_accepts_independent_pane_and_agent_
   state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
   assert_equal "$(jq -r '.panes[0].revision' "$state")" 7
   assert_equal "$(jq -r '.agents[0].revision' "$state")" 42
-  assert_equal "$(jq -r '.panes[0].label' "$state")" " red-wolf"
-  assert_equal "$(jq -r '.tabs[0].label' "$state")" " red-wolf"
+  assert_equal "$(jq -r '.panes[0].label' "$state")" "  red-wolf"
+  assert_equal "$(jq -r '.tabs[0].label' "$state")" "  red-wolf"
   run grep '^agent rename' "$HPL_LOG"
   assert_failure
 }
@@ -626,7 +626,7 @@ function test_scripts_1115_herdr_pane_labels_never_renames_a_stale_target_that_e
   hpl_presentation_run
   run grep -c '^agent rename pane-1' "$HPL_LOG"
   assert_output 1
-  assert_equal "$(jq -r '.panes[0].label' "$state")" "󰰕 $(jq -r '.agents[0].name' "$state")"
+  assert_equal "$(jq -r '.panes[0].label' "$state")" "󰰕  $(jq -r '.agents[0].name' "$state")"
 }
 
 function test_scripts_1116_herdr_pane_labels_accepts_a_same_pane_replacement_in_th() {
@@ -648,7 +648,7 @@ function test_scripts_1116_herdr_pane_labels_accepts_a_same_pane_replacement_in_
   hpl_request_only
   hpl_presentation_run
   assert_equal "$(jq -r '.agents[0].name' "$state")" "$candidate"
-  assert_equal "$(jq -r '.panes[0].label' "$state")" "󰎡 $candidate"
+  assert_equal "$(jq -r '.panes[0].label' "$state")" "󰎡  $candidate"
   run grep -c '^agent rename pane-1' "$HPL_LOG"
   assert_output 1
   unset HERDR_ALIAS_TEST_SEED
@@ -692,8 +692,8 @@ function test_scripts_1117_herdr_pane_labels_rejects_incomplete_malformed_duplic
   : > "$HPL_LOG"
   run hpl_sweep_run --sweep
   assert_success
-  assert_file_contains "$HPL_LOG" '^pane rename pane-1  red-wolf$'
-  assert_file_contains "$HPL_LOG" '^pane rename pane-2 󰎡 blue-otter$'
+  assert_file_contains "$HPL_LOG" '^pane rename pane-1   red-wolf$'
+  assert_file_contains "$HPL_LOG" '^pane rename pane-2 󰎡  blue-otter$'
 
   hpl_setup
   hpl_set_agent_pane "$HPL_DEFAULT_SOCKET" pane-1 tab-1 ws-1 term-1 claude semantic-name
@@ -734,7 +734,7 @@ function test_scripts_1118_herdr_pane_labels_rejects_a_complete_stale_post_renam
   hpl_request_only
   hpl_presentation_run
   assert_file_contains "$HPL_LOG" '^agent rename pane-1 '
-  run grep -q '^ ' <<<"$(jq -r '.panes[0].label' "$state")"
+  run grep -q '^  ' <<<"$(jq -r '.panes[0].label' "$state")"
   assert_success
 }
 
@@ -856,7 +856,7 @@ function test_scripts_1125_herdr_pane_labels_presentation_automatically_corrects
   hpl_event_run
   hpl_wait_for_presentation_quiescence "$HPL_DEFAULT_SOCKET"
   run grep '^pane rename' "$HPL_LOG"
-  assert_output "pane rename pane-1  red-wolf"
+  assert_output "pane rename pane-1   red-wolf"
   run grep -c '^tab rename' "$HPL_LOG"
   assert_failure
 
@@ -865,8 +865,8 @@ function test_scripts_1125_herdr_pane_labels_presentation_automatically_corrects
   : > "$HPL_LOG"
   hpl_event_run
   hpl_wait_for_presentation_quiescence "$HPL_DEFAULT_SOCKET"
-  assert_file_contains "$HPL_LOG" '^pane rename pane-1  red-wolf$'
-  assert_file_contains "$HPL_LOG" '^tab rename tab-1  red-wolf$'
+  assert_file_contains "$HPL_LOG" '^pane rename pane-1   red-wolf$'
+  assert_file_contains "$HPL_LOG" '^tab rename tab-1   red-wolf$'
   run grep -E 'owner|reclaim|notification' "$HPL_LOG"
   assert_failure
 }
@@ -2465,8 +2465,8 @@ function test_scripts_1165_herdr_pane_labels_sweep_repairs_an_external_pane_rena
   : > "$HPL_LOG"
   run hpl_sweep_run --sweep
   assert_success
-  assert_equal "$(jq -r '.panes[0].label' "$(hpl_socket_state "$HPL_DEFAULT_SOCKET")")" " red-wolf"
-  assert_file_contains "$HPL_LOG" '^pane rename pane-1  red-wolf$'
+  assert_equal "$(jq -r '.panes[0].label' "$(hpl_socket_state "$HPL_DEFAULT_SOCKET")")" "  red-wolf"
+  assert_file_contains "$HPL_LOG" '^pane rename pane-1   red-wolf$'
 }
 
 function test_scripts_1166_herdr_pane_labels_sweep_repairs_process_and_cwd_changes() {
@@ -2515,7 +2515,7 @@ function test_scripts_1167_herdr_pane_labels_names_a_command_pane_after_the_proc
   hpl_sweep_run --sweep
   assert_equal "$(hpl_pane_label pane-2)" "bun run dev"
   run grep -m1 '^tab rename' "$HPL_LOG"
-  assert_output "tab rename tab-1  red-wolf · bun run dev"
+  assert_output "tab rename tab-1   red-wolf · bun run dev"
 }
 
 # A pane whose foreground process group is its own shell runs nothing. It keeps
@@ -2533,7 +2533,7 @@ function test_scripts_1168_herdr_pane_labels_names_an_idle_pane_with_the_placeho
   hpl_sweep_run --sweep
   assert_equal "$(hpl_pane_label pane-2)" "~"
   run grep -m1 '^tab rename' "$HPL_LOG"
-  assert_output "tab rename tab-1  red-wolf · ~"
+  assert_output "tab rename tab-1   red-wolf · ~"
 }
 
 # The session coordinator knows tab position, so task invalidation and sweeps
@@ -2788,7 +2788,7 @@ function test_scripts_1179_herdr_pane_labels_names_an_agent_whose_fresh_pane_rep
   alias="$(jq -r '.agents[0].name // ""' "$state")"
   run herdr_alias_in_pool "$alias"
   assert_success
-  assert_equal "$(jq -r '.panes[0].label' "$state")" " $alias"
+  assert_equal "$(jq -r '.panes[0].label' "$state")" "  $alias"
 }
 
 function test_scripts_1180_herdr_pane_labels_agent_cwd_record_overrides_agent_cwd_() {
