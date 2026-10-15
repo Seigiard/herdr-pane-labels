@@ -67,6 +67,29 @@ test_clean_install() {
   pass 'clean install'
 }
 
+test_install_ignores_a_stale_shared_alias_library() {
+  local candidates count unique home="$WORK/stale-alias-home"
+  prepare_home "$home"
+  cat > "$home/.local/lib/herdr-aliases.sh" <<'SH'
+herdr_alias_candidates() {
+  printf '%s\n' stale-alias-library-used
+}
+SH
+  HOME="$home" "$ROOT/scripts/install-cli-shim.sh"
+  candidates="$(HOME="$home" "$home/.local/bin/herdr-pane-labels" --alias-candidates stale)" || \
+    fail 'installed CLI ignores the stale shared alias library'
+  printf '%s\n' "$candidates" | grep -qx 'stale-alias-library-used' && \
+    fail 'installed CLI does not source the stale shared alias library'
+  count="$(printf '%s\n' "$candidates" | wc -l | tr -d ' ')"
+  [ "$count" -ge 1024 ] || fail 'installed CLI returns the package alias pool'
+  unique="$(printf '%s\n' "$candidates" | sort -u | wc -l | tr -d ' ')"
+  [ "$unique" = "$count" ] || fail 'installed CLI returns unique aliases'
+  printf '%s\n' "$candidates" | awk '!/^[a-z]+-[a-z]+$/ { exit 1 }' || \
+    fail 'installed CLI aliases use the supported grammar'
+  pass 'installed CLI ignores stale shared alias library'
+}
+
 test_alias_contract
 test_package_diagnostics
 test_clean_install
+test_install_ignores_a_stale_shared_alias_library

@@ -392,7 +392,7 @@ function test_scripts_1210_herdr_pane_labels_calls_the_shared_matcher_with_v1_fo
   cat > "$HPL_HOME/.local/lib/herdr-process.sh" <<SH
 $(sed 's/^process_start_matches()/canonical_process_start_matches()/' "$SOURCE_ROOT/tests/fixtures/herdr-process.sh")
 process_start_matches() {
-  printf '%s\n' "\$#" >> "$calls"
+  printf '%s\t%s\n' "\$#" "\${3:-}" >> "$calls"
   canonical_process_start_matches "\$@"
 }
 SH
@@ -403,9 +403,12 @@ SH
     "$(printf '%s' "$HPL_DEFAULT_SOCKET" | base64 | tr -d '\n')" > "$lock"
   run hpl_event_run
   assert_success
-  run cat "$calls"
+  run awk '
+    $1 != 3 || $2 != "ps-lstart-c-utc-v1" { exit 1 }
+    { calls += 1 }
+    END { exit calls == 0 }
+  ' "$calls"
   assert_success
-  assert_output 3
 }
 
 function test_scripts_1214_herdr_pane_labels_reclaims_claims_by_the_v1_contract() {
@@ -477,7 +480,7 @@ function test_scripts_1211_herdr_pane_labels_rejects_a_missing_shared_process_li
   done
   run env HOME="$HPL_HOME" "$SOURCE_ROOT/scripts/install-cli-shim.sh"
   assert_success
-  rm "$HPL_HOME/.local/lib/herdr-process.sh"
+  assert_file_not_exists "$HPL_HOME/.local/lib/herdr-process.sh"
   run --separate-stderr env HOME="$HPL_HOME" "$HPL_HOME/.local/bin/herdr-pane-labels" --help
   assert_failure
   assert_stderr "$expected"
