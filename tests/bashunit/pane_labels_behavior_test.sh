@@ -1152,7 +1152,7 @@ function test_scripts_1134_herdr_pane_labels_location_detached_publishes_a_commi
   state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
   # The non-Git arm clears every Git token, keeps a foreign source's token, and
   # publishes the directory name as the only thing this pane can report.
-  assert_equal "$(jq -c '.panes[0].tokens' "$state")" "$(jq -nc --arg ref "$HPL_ICON_FOLDER non-git" '{foreign:"kept",machine_workspace:"repo",git_ref:$ref}')"
+  assert_equal "$(jq -c '.panes[0].tokens' "$state")" "$(jq -nc --arg ref "$HPL_ICON_FOLDER non-git" '{foreign:"kept",headline:"repo",git_ref:$ref}')"
   run test "$(hpl_location_source_seq "$HPL_DEFAULT_SOCKET" pane-1)" -gt "$second_seq"
   assert_success
 }
@@ -1499,8 +1499,8 @@ function test_scripts_1142_herdr_pane_labels_transient_location_preserves_live_t
   run jq -e \
     --arg ref_one "$HPL_ICON_BRANCH topic-one $HPL_ICON_STALE" \
     --arg ref_two "$HPL_ICON_FOLDER live-token $HPL_ICON_STALE" '
-    (.panes[] | select(.pane_id == "pane-1") | .tokens == {repo:"live-repo",worktree:"live-token",branch:"topic-one",location_status:"stale",git_ref:$ref_one,machine_workspace:"ws-1"})
-    and (.panes[] | select(.pane_id == "pane-2") | .tokens == {repo:"live-repo",worktree:"live-token",location_status:"stale",git_ref:$ref_two,machine_workspace:"ws-1"})
+    (.panes[] | select(.pane_id == "pane-1") | .tokens == {repo:"live-repo",worktree:"live-token",branch:"topic-one",location_status:"stale",git_ref:$ref_one,headline:"ws-1"})
+    and (.panes[] | select(.pane_id == "pane-2") | .tokens == {repo:"live-repo",worktree:"live-token",location_status:"stale",git_ref:$ref_two,headline:"ws-1"})
   ' "$state"
   assert_success
   assert_equal "$(jq -r '.tabs[0].label' "$state")" "one · two · three"
@@ -1760,27 +1760,30 @@ function test_scripts_1206_herdr_pane_labels_names_the_space_a_worktree_space_ca
   assert_success
 }
 
-function test_scripts_1224_herdr_pane_labels_joins_the_machine_glyph_and_space_nam() {
-  _bats_test_init 1224 'herdr-pane-labels joins the machine glyph and the space name into one token, marks a child agent, and follows a rename'
+function test_scripts_1224_herdr_pane_labels_lays_out_agent_rows_and_collapses_a_chil() {
+  _bats_test_init 1224 'herdr-pane-labels lays out agent rows, collapses a child agent to one row, and follows a rename'
   command -v jq >/dev/null || skip "jq not available"
   hpl_setup
-  # given: a pane whose shell reported a machine glyph, a pane whose shell
-  # reported none, and a pane the resource tree records as a child agent
-  local work="$HPL_WORK/work" state
+  # given: an agent whose shell reported a machine glyph, a shell pane that
+  # reported none, and an agent the resource tree records as a child
+  local work="$HPL_WORK/work" state parent_label child_label
   mkdir -p "$work"
   hpl_git_fixture "$work" "" 1 ready 'fatal: not a git repository'
-  hpl_set_pane "$HPL_DEFAULT_SOCKET" "$(hpl_process_pane_json pane-1 tab-1 "$work" | jq -c '.tokens.machine = "M"')"
+  hpl_set_location_agent_pane "$HPL_DEFAULT_SOCKET" pane-1 tab-1 "$work"
   hpl_set_pane "$HPL_DEFAULT_SOCKET" "$(hpl_process_pane_json pane-2 tab-2 "$work" | jq -c '.workspace_id = "ws-2"')"
-  hpl_set_pane "$HPL_DEFAULT_SOCKET" "$(hpl_process_pane_json pane-3 tab-3 "$work" | jq -c '.workspace_id = "ws-3" | .tokens.machine = "M"')"
+  hpl_set_location_agent_pane "$HPL_DEFAULT_SOCKET" pane-3 tab-3 "$work"
+  state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
+  jq '(.panes[] | select(.pane_id == "pane-1")).tokens.machine = "M"
+    | (.panes[] | select(.pane_id == "pane-3")) |= (.workspace_id = "ws-3" | .tokens.machine = "M")
+    | (.agents[] | select(.pane_id == "pane-3")).workspace_id = "ws-3"' \
+    "$state" > "$state.tmp" && mv "$state.tmp" "$state"
   hpl_set_tab "$HPL_DEFAULT_SOCKET" '{"tab_id":"tab-1","workspace_id":"ws-1","label":""}'
   hpl_set_tab "$HPL_DEFAULT_SOCKET" '{"tab_id":"tab-2","workspace_id":"ws-2","label":""}'
   hpl_set_tab "$HPL_DEFAULT_SOCKET" '{"tab_id":"tab-3","workspace_id":"ws-3","label":""}'
   hpl_set_workspace "$HPL_DEFAULT_SOCKET" '{"workspace_id":"ws-1","label":"Task Name","worktree":{"repo_name":"repository","is_linked_worktree":true}}'
   hpl_set_workspace "$HPL_DEFAULT_SOCKET" '{"workspace_id":"ws-2","label":"Other"}'
   hpl_set_workspace "$HPL_DEFAULT_SOCKET" '{"workspace_id":"ws-3","label":"Child Space","worktree":{"repo_name":"repository","is_linked_worktree":true}}'
-  hpl_set_process_label pane-1 one
   hpl_set_process_label pane-2 two
-  hpl_set_process_label pane-3 three
   cat > "$HPL_STUB/herdr-resource-tree" <<'TREE'
 #!/bin/sh
 [ "$1" = --json ] || exit 2
@@ -1796,24 +1799,32 @@ TREE
   # when: one location/presentation pass runs
   hpl_location_pass
   state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
+  parent_label="$(jq -r '.panes[] | select(.pane_id == "pane-1") | .label' "$state")"
+  child_label="$(jq -r '.panes[] | select(.pane_id == "pane-3") | .label' "$state")"
 
-  # then: the glyph and the name share one token with a two-space gap, a
-  # pane without a glyph carries the bare name, and a child agent reads a dash
-  # in place of the glyph and drops the origin its parent already shows
-  assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-1") | .tokens.machine_workspace' "$state")" "M  Task Name"
-  assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-2") | .tokens.machine_workspace' "$state")" "Other"
-  assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-3") | .tokens.machine_workspace' "$state")" "- Child Space"
+  # then: the parent agent fills all three rows: glyph and name with a
+  # two-space gap, the origin, and its pane label
+  run grep -q "^$(printf '\356\262\202')  " <<<"$parent_label" # nf-cod-claude U+EC82
+  assert_success
+  assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-1") | .tokens.headline' "$state")" "M  Task Name"
   assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-1") | .tokens.space_origin' "$state")" repository
-  run jq -e '.panes[] | select(.pane_id == "pane-3") | .tokens.space_origin == null' "$state"
+  assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-1") | .tokens.agent_line' "$state")" "$parent_label"
+  # and: a shell pane without a glyph carries the bare name and no agent line
+  assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-2") | .tokens.headline' "$state")" "Other"
+  run jq -e '.panes[] | select(.pane_id == "pane-2") | .tokens.agent_line == null' "$state"
+  assert_success
+  # and: the child agent keeps only its headline, a dash and its pane label
+  assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-3") | .tokens.headline' "$state")" "- $child_label"
+  run jq -e '.panes[] | select(.pane_id == "pane-3") | .tokens.space_origin == null and .tokens.agent_line == null' "$state"
   assert_success
 
   # when: the space is renamed and another pass runs
-  hpl_set_workspace "$HPL_DEFAULT_SOCKET" '{"workspace_id":"ws-1","label":"Renamed"}'
+  hpl_set_workspace "$HPL_DEFAULT_SOCKET" '{"workspace_id":"ws-1","label":"Renamed","worktree":{"repo_name":"repository","is_linked_worktree":true}}'
   hpl_location_pass
   state="$(hpl_socket_state "$HPL_DEFAULT_SOCKET")"
 
-  # then: the token follows the new name
-  assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-1") | .tokens.machine_workspace' "$state")" "M  Renamed"
+  # then: the headline follows the new name
+  assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-1") | .tokens.headline' "$state")" "M  Renamed"
 }
 
 function test_scripts_1207_herdr_pane_labels_reports_branch_and_counts_as_space_() {
