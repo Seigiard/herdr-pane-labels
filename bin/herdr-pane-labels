@@ -1849,8 +1849,8 @@ run_sweep_daemon() {
     fi
     sleep 0.01
   done
-  printf '%s\n' "$start" > "$SWEEP_LOCK_DIR/start" 2>/dev/null
   printf '%s\n' ps-lstart-c-utc-v1 > "$SWEEP_LOCK_DIR/identity_format" 2>/dev/null
+  printf '%s\n' "$start" > "$SWEEP_LOCK_DIR/start" 2>/dev/null
   # Two traps, not one: a TERM handler that only cleans up would let the loop
   # carry on after it dropped its own lock, and the next hook would then start
   # a second daemon beside the first.
