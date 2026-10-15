@@ -1803,12 +1803,12 @@ TREE
   child_label="$(jq -r '.panes[] | select(.pane_id == "pane-3") | .label' "$state")"
 
   # then: the parent agent carries glyph and name with a two-space gap, the
-  # origin, and its pane label after four Braille blanks (U+2800)
+  # origin, and its pane label after three Braille blanks (U+2800)
   run grep -q "^$(printf '\356\262\202')  " <<<"$parent_label" # nf-cod-claude U+EC82
   assert_success
   assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-1") | .tokens.headline' "$state")" "M  Task Name"
   assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-1") | .tokens.space_origin' "$state")" repository
-  assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-1") | .tokens.agent_line' "$state")" "$(printf '\342\240\200\342\240\200\342\240\200\342\240\200')$parent_label"
+  assert_equal "$(jq -r '.panes[] | select(.pane_id == "pane-1") | .tokens.agent_line' "$state")" "$(printf '\342\240\200\342\240\200\342\240\200')$parent_label"
   run jq -e '.panes[] | select(.pane_id == "pane-1") | .tokens.child_gap == null' "$state"
   assert_success
   # and: a shell pane without a glyph carries the bare name and no agent line
