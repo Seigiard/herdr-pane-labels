@@ -387,10 +387,11 @@ retained_location=$(encode_value "$retained_location")"
 # is "- <pane label>", and space_origin and agent_line stay empty. Its parent's
 # entry already shows the machine, the workspace and the origin.
 #
-# The agent line starts with four no-break spaces, so the parent's agent icon
-# sits further right than its workspace row. No-break, because herdr may trim
-# plain leading spaces.
-AGENT_LINE_INDENT=$'\xc2\xa0\xc2\xa0\xc2\xa0\xc2\xa0'
+# The agent line starts with four blank cells, so the parent's agent icon sits
+# further right than its workspace row. herdr trims every Unicode space from a
+# token value, the no-break space U+00A0 included, so the cells are the Braille
+# blank U+2800: it renders empty but is not classed as whitespace.
+AGENT_LINE_INDENT=$'\xe2\xa0\x80\xe2\xa0\x80\xe2\xa0\x80\xe2\xa0\x80'
 headline_value() {
   local machine="$1" label="$2" child="$3" pane_label="$4"
   if [ "$child" = 1 ]; then printf -- '- %s' "$pane_label"
