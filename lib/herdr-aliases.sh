@@ -1,115 +1,45 @@
 #!/usr/bin/env bash
 
 HERDR_ALIAS_COLORS=(
-  amber aqua azure beige black blue bronze brown
-  coral cream crimson cyan gold gray green indigo
-  ivory jade khaki lilac lime magenta maroon navy
-  ochre olive orange pink purple red silver teal
+  amber aqua azure beige black blue brown coral
+  cream cyan gold gray green ivory jade khaki
+  lilac lime navy ochre olive pink red teal
 )
 
 HERDR_ALIAS_ANIMALS=(
-  aardvark
-  abyssinian
-  affenpinscher
-  akbash
   akita
-  alligator
-  alpaca
   ant
-  anteater
-  antelope
-  arapaima
-  armadillo
-  aurochs
-  avocet
-  axolotl
-  baboon
-  badger
   baiji
-  balinese
   barb
   bat
   bear
-  beetle
-  birman
   bison
-  blobfish
   boar
-  bobcat
-  boggle
-  bombay
   bongo
-  bonobo
   booby
-  buffalo
-  bulldog
-  bullfrog
-  bumblebee
-  burmese
   camel
-  caracal
   carp
-  cassowary
   cat
-  caterpillar
-  catfish
-  centipede
-  chameleon
-  chamois
-  cheetah
-  chicken
-  chihuahua
-  chimaera
-  chimpanzee
-  chinchilla
-  chinook
-  cicada
-  cichlid
-  clownfish
   coati
   cobra
-  cockatoo
-  cockroach
-  codfish
-  coelacanth
-  collie
   coral
-  cougar
   cow
-  coyote
   crab
   crane
-  crocodile
   crow
-  dachshund
-  dalmatian
-  damselfly
   deer
   dhole
   dingo
-  discus
   dodo
   dog
   dogo
-  dolphin
-  donkey
-  dormouse
   duck
-  dugong
   eagle
-  earwig
-  echidna
   eel
-  elephant
   elk
   emu
-  ermine
-  falcon
-  ferret
   finch
   fish
-  flamingo
-  flounder
   fluke
   fly
   fossa
@@ -117,146 +47,64 @@ HERDR_ALIAS_ANIMALS=(
   frog
   gar
   gecko
-  gibbon
-  giraffe
   goat
   goose
-  gopher
-  gorilla
-  grasshopper
-  greyhound
-  grouse
-  guinea
-  hamster
   hare
-  hedgehog
   heron
-  herring
-  hippopotamus
   horse
   human
   hyena
   ibex
   ibis
-  iguana
-  impala
-  insect
-  jackal
-  jaguar
-  jellyfish
-  jerboa
-  kakapo
-  kangaroo
   kiwi
   koala
   krill
   kudu
-  lemming
   lemur
-  leopard
   liger
   lion
-  lizard
   llama
   loach
-  lobster
-  locust
-  lungfish
   lynx
   macaw
   mole
   molly
-  mongoose
-  mongrel
-  monkey
-  monkfish
   moose
   moth
   mouse
   mule
-  narwhal
   newt
-  numbat
-  ocelot
-  octopus
   okapi
   olm
-  opossum
-  ostrich
   otter
-  oyster
   panda
-  pangolin
-  panther
-  parrot
-  peacock
-  pelican
-  penguin
-  pheasant
   pig
-  pigeon
   pika
-  platypus
-  pointer
   polar
-  porcupine
-  porpoise
-  possum
   prawn
-  puffin
   pug
   quail
-  quetzal
-  quokka
   quoll
-  rabbit
-  raccoon
   rat
-  rattlesnake
   raven
-  reindeer
-  rhinoceros
   robin
-  salamander
-  salmon
-  samoyed
-  sawfish
-  scorpion
   seal
-  serval
   shark
   sheep
-  shrimp
   skunk
   sloth
   snail
   snake
-  sparrow
   squid
-  squirrel
-  starfish
   stoat
-  sturgeon
   swan
-  termite
-  terrier
   tetra
   tiger
   toad
-  tortoise
-  toucan
   tuna
-  turkey
-  vulture
-  wallaby
-  walrus
   wasp
-  weasel
   whale
-  whippet
   wolf
-  wombat
-  woodpecker
   worm
   zebra
   zebu
@@ -373,7 +221,7 @@ herdr_alias_candidates() {
   [[ "$checksum" =~ ^[0-9]+$ ]] || return 1
   offset=$((checksum % pool_size))
 
-  # awk walks the 8064-entry rotation in one process; the bash loop it
+  # awk walks the 2424-entry rotation in one process; the bash loop it
   # replaces spent ~150ms per call on printf alone. The blank line separates
   # the two dictionaries on stdin, which no word can collide with because
   # every word already matched ^[a-z]+$ above.
